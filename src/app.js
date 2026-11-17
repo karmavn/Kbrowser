@@ -230,17 +230,27 @@ listen("tab-updated", ({ payload: p }) => {
     if (!t.bounced) { t.bounced = true; invoke("nav", { id: p.id, action: "back" }); }
     return;
   }
-  if (p.url != null) {
+  let changed = false;
+  if (p.url != null && p.url !== t.url) {
     t.url = p.url;
+    changed = true;
     if (t.title === "New tab") {
       try { t.title = new URL(p.url).hostname; } catch {}
     }
   }
-  if (p.title) t.title = p.title;
-  if (p.loading != null) t.loading = p.loading;
-  render();
-  // Record when a load finishes, and again if the title arrives afterwards.
-  if (p.loading === false || (p.title && !t.loading)) record(t);
+  if (p.title != null && p.title !== t.title) {
+    t.title = p.title;
+    changed = true;
+  }
+  if (p.loading != null && p.loading !== t.loading) {
+    t.loading = p.loading;
+    changed = true;
+  }
+  if (changed) {
+    render();
+    // Record when a load finishes, and again if the title arrives afterwards.
+    if (p.loading === false || (p.title && !t.loading)) record(t);
+  }
 });
 
 listen("open-tab", ({ payload: url }) => (INTERNAL.has(url) ? openInternal(url) : openTab(url)));
@@ -284,14 +294,19 @@ let sel = -1;
 let suggestTimer = 0;
 let suggestSeq = 0;
 
+let currentSuggestH = 0;
+
 function closeSuggest() {
   clearTimeout(suggestTimer);
   suggestSeq++; // drop any answer still on its way
-  if (!rows.length) return;
+  if (!rows.length && currentSuggestH === 0) return;
   rows = [];
   sel = -1;
   $("#suggest").hidden = true;
-  invoke("set_suggest_height", { height: 0 });
+  if (currentSuggestH !== 0) {
+    currentSuggestH = 0;
+    invoke("set_suggest_height", { height: 0 });
+  }
 }
 
 function paintSuggest() {
@@ -350,7 +365,11 @@ async function updateSuggest() {
   sel = -1;
   paintSuggest();
   $("#suggest").hidden = false;
-  invoke("set_suggest_height", { height: rows.length * ROW_H + PAD });
+  const targetH = rows.length * ROW_H + PAD;
+  if (currentSuggestH !== targetH) {
+    currentSuggestH = targetH;
+    invoke("set_suggest_height", { height: targetH });
+  }
 }
 
 //address bar
@@ -390,12 +409,12 @@ window.addEventListener("keydown", (e) => {
   else if (k === "n") { e.preventDefault(); openInternal("about:new"); }
 });
 
-// Custom window frame: drag the empty strip, double-click to maximize.
+// Custom window frame: drag is handled natively by data-tauri-drag-region, double-click to maximize.
 const MAX_SVG = '<svg viewBox="0 0 10 10"><path d="M.5.5h9v9h-9z"/></svg>';
 const RESTORE_SVG = '<svg viewBox="0 0 10 10"><path d="M2.5 2.5v-2h7v7h-2M.5 2.5h7v7h-7z"/></svg>';
-$("#strip").addEventListener("mousedown", (e) => {
-  if (e.button !== 0 || e.target.closest(".tab, button")) return;
-  invoke(e.detail === 2 ? "win_toggle_maximize" : "win_drag");
+$("#strip").addEventListener("dblclick", (e) => {
+  if (e.target.closest(".tab, button")) return;
+  invoke("win_toggle_maximize");
 });
 //window controls
 $("#win-min").onclick = () => invoke("win_minimize");
@@ -408,7 +427,11 @@ async function syncMax() {
   b.title = max ? "Restore" : "Maximize";
   b.setAttribute("aria-label", b.title);
 }
-window.addEventListener("resize", syncMax); // the UI webview resizes with the window
+let resizeTimer;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(syncMax, 150);
+});
 syncMax();
 
 (async () => {

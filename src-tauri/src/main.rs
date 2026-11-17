@@ -31,6 +31,9 @@ struct Mica(bool);
 /// Page webviews slide down by the same amount so the list is not covered by them.
 struct Suggest(std::sync::Mutex<f64>);
 
+/// Currently active tab webview label.
+struct ActiveTab(std::sync::Mutex<Option<String>>);
+
 /// URL passed on the command line at first launch; the UI takes it once at startup.
 struct Launch(std::sync::Mutex<Option<String>>);
 
@@ -145,6 +148,11 @@ fn layout(window: &Window) {
     let size = px.to_logical::<f64>(scale);
     let content_h = (size.height - CHROME_H).max(0.0);
     let extra = *window.app_handle().state::<Suggest>().0.lock().unwrap();
+    let active_label = window
+        .app_handle()
+        .try_state::<ActiveTab>()
+        .and_then(|a| a.0.lock().unwrap().clone());
+
     for (name, wv) in window.app_handle().webviews() {
         if name == "ui" {
             let _ = wv.set_size(Size::Logical(LogicalSize::new(
@@ -152,18 +160,49 @@ fn layout(window: &Window) {
                 CHROME_H + extra,
             )));
         } else if name.starts_with("tab-") {
-            // Only moved, not resized: the page keeps its layout while the suggestion list is open.
-            let _ = wv.set_position(Position::Logical(LogicalPosition::new(
-                0.0,
-                CHROME_H + extra,
-            )));
-            let _ = wv.set_size(Size::Logical(LogicalSize::new(size.width, content_h)));
+            // Only update position/size for the visible active tab to prevent background GPU/DWM thrashing
+            if active_label.as_ref().map_or(true, |act| act == &name) {
+                let _ = wv.set_position(Position::Logical(LogicalPosition::new(
+                    0.0,
+                    CHROME_H + extra,
+                )));
+                let _ = wv.set_size(Size::Logical(LogicalSize::new(size.width, content_h)));
+            }
         }
     }
 }
 
 fn show_only(app: &AppHandle, id: &str) {
     let keep = label(id);
+    if let Some(act) = app.try_state::<ActiveTab>() {
+        *act.0.lock().unwrap() = Some(keep.clone());
+    }
+    // Update newly visible tab dimensions immediately before showing
+    if let Some(w) = app.get_window("main") {
+        if let (Ok(scale), Ok(px)) = (w.scale_factor(), w.inner_size()) {
+            let size = px.to_logical::<f64>(scale);
+            let content_h = (size.height - CHROME_H).max(0.0);
+            let extra = *app.state::<Suggest>().0.lock().unwrap();
+
+            for (name, wv) in app.webviews() {
+                if name.starts_with("tab-") {
+                    if name == keep {
+                        let _ = wv.set_position(Position::Logical(LogicalPosition::new(
+                            0.0,
+                            CHROME_H + extra,
+                        )));
+                        let _ = wv.set_size(Size::Logical(LogicalSize::new(size.width, content_h)));
+                        let _ = wv.show();
+                        let _ = wv.set_focus();
+                    } else {
+                        let _ = wv.hide();
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     for (name, wv) in app.webviews() {
         if name.starts_with("tab-") {
             if name == keep {
@@ -532,7 +571,15 @@ fn history_suggest(app: AppHandle, query: String) -> Vec<data::Suggestion> {
 /// Grows (or shrinks back) the UI webview for the address-bar suggestion list.
 #[tauri::command]
 async fn set_suggest_height(app: AppHandle, height: f64) {
-    *app.state::<Suggest>().0.lock().unwrap() = height.clamp(0.0, 400.0);
+    let height = height.clamp(0.0, 400.0);
+    {
+        let suggest_state = app.state::<Suggest>();
+        let mut cur = suggest_state.0.lock().unwrap();
+        if (*cur - height).abs() < 1.0 {
+            return; // Height hasn't changed; avoid redundant DWM layout recalculations
+        }
+        *cur = height;
+    }
     if let Some(w) = app.get_window("main") {
         layout(&w);
     }
@@ -652,6 +699,7 @@ fn main() {
             app.manage(Ext(ext.clone()));
             app.manage(Loaded(std::sync::Mutex::new(loaded)));
             app.manage(Suggest(std::sync::Mutex::new(0.0)));
+            app.manage(ActiveTab(std::sync::Mutex::new(None)));
             app.manage(data);
 
             // url given in command line
@@ -704,15 +752,17 @@ fn main() {
 
             window.show()?;
 
-            //Window movement gets captured and saved for persistence.
+            // Window movement and bounds captured without blocking the UI drag loop
             let w = window.clone();
             window.on_window_event(move |e| match e {
                 WindowEvent::Resized(_) => {
                     layout(&w);
                     track_window(&w);
                 }
-                WindowEvent::Moved(_) => track_window(&w),
-                WindowEvent::CloseRequested { .. } => persist(w.app_handle()),
+                WindowEvent::CloseRequested { .. } => {
+                    track_window(&w);
+                    persist(w.app_handle());
+                }
                 _ => {}
             });
             Ok(())

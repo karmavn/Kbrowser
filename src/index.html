@@ -7,12 +7,12 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div id="strip">
+  <div id="strip" data-tauri-drag-region>
     <div id="tabs" role="tablist"></div>
     <button id="new" class="icon" title="New tab (Ctrl+T)" aria-label="New tab">
       <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
     </button>
-    <div id="spacer"></div>
+    <div id="spacer" data-tauri-drag-region></div>
     <div id="controls">
       <button id="win-min" class="cap" title="Minimize" aria-label="Minimize"><svg viewBox="0 0 10 10"><path d="M0 5h10"/></svg></button>
       <button id="win-max" class="cap" title="Maximize" aria-label="Maximize"><svg viewBox="0 0 10 10"><path d="M.5.5h9v9h-9z"/></svg></button>
