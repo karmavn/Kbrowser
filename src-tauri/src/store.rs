@@ -10,10 +10,20 @@ use std::{
     fs,
     io::Cursor,
     path::{Path, PathBuf},
+    sync::LazyLock,
+    time::Duration,
 };
 use tauri::{AppHandle, Manager};
 
 use crate::{Ext, Loaded, live};
+
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
+});
 
 #[derive(Serialize)]
 pub struct ExtInfo {
@@ -84,7 +94,9 @@ async fn download(id: &str) -> Result<Vec<u8>, String> {
     let url = format!(
         "https://clients2.google.com/service/update2/crx?response=redirect&prodversion={ver}&acceptformat=crx2,crx3&x=id%3D{id}%26uc"
     );
-    let res = reqwest::get(&url)
+    let res = HTTP_CLIENT
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("Download failed: {e}"))?;
     if !res.status().is_success() {
@@ -239,7 +251,7 @@ pub async fn install(app: &AppHandle, input: &str) -> Result<ExtInfo, String> {
     info(app, &dest).ok_or_else(|| "Installed, but the manifest could not be read".to_string())
 }
 
-fn info(app: &AppHandle, dir: &Path) -> Option<ExtInfo> {
+fn read_info(dir: &Path, active: bool) -> Option<ExtInfo> {
     let id = dir.file_name()?.to_str()?.to_string();
     let m = read_json(&dir.join("manifest.json"))?;
     let mut name = m["name"].as_str().unwrap_or(&id).to_string();
@@ -260,11 +272,6 @@ fn info(app: &AppHandle, dir: &Path) -> Option<ExtInfo> {
             name = text.to_string();
         }
     }
-    let active = {
-        let state = app.state::<Loaded>();
-        let loaded = state.0.lock().unwrap();
-        loaded.contains(&id)
-    };
     Some(ExtInfo {
         version: m["version"].as_str().unwrap_or("").to_string(),
         active,
@@ -272,6 +279,16 @@ fn info(app: &AppHandle, dir: &Path) -> Option<ExtInfo> {
         id,
         name,
     })
+}
+
+fn info(app: &AppHandle, dir: &Path) -> Option<ExtInfo> {
+    let id = dir.file_name()?.to_str()?;
+    let active = {
+        let state = app.state::<Loaded>();
+        let loaded = state.0.lock().unwrap();
+        loaded.iter().any(|x| x == id)
+    };
+    read_info(dir, active)
 }
 
 /// Relative path of the extension's settings page (MV3 `options_ui`, or MV2 `options_page`).
@@ -309,6 +326,10 @@ pub async fn options_url(app: &AppHandle, id: &str) -> Result<String, String> {
 
 pub fn list(app: &AppHandle) -> Vec<ExtInfo> {
     let Ok(root) = root(app) else { return vec![] };
+    let loaded: std::collections::HashSet<String> = {
+        let state = app.state::<Loaded>();
+        state.0.lock().unwrap().iter().cloned().collect()
+    };
     let mut out: Vec<ExtInfo> = fs::read_dir(root)
         .into_iter()
         .flatten()
@@ -320,7 +341,11 @@ pub fn list(app: &AppHandle) -> Vec<ExtInfo> {
                     .file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with('.'))
         })
-        .filter_map(|p| info(app, &p))
+        .filter_map(|p| {
+            let id = p.file_name()?.to_str()?;
+            let active = loaded.contains(id);
+            read_info(&p, active)
+        })
         .collect();
     out.sort_by_key(|e| e.name.to_lowercase());
     out

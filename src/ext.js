@@ -3,12 +3,12 @@ const $ = (s) => document.querySelector(s);
 async function load() {
   const exts = await invoke("list_extensions");
   const list = $("#list");
-  list.replaceChildren();
+  const frag = document.createDocumentFragment();
   if (!exts.length) {
     const li = document.createElement("li");
     li.className = "empty";
     li.textContent = "No extensions yet. Open an extension on the Chrome Web Store and select Add to browser.";
-    list.append(li);
+    frag.append(li);
   }
   for (const e of exts) {
     const li = document.createElement("li");
@@ -42,8 +42,9 @@ async function load() {
     actions.className = "actions";
     actions.append(opts, rm);
     li.append(text, actions);
-    list.append(li);
+    frag.append(li);
   }
+  list.replaceChildren(frag);
   $("#banner").hidden = !exts.some((e) => !e.active);
 }
 
@@ -51,13 +52,20 @@ $("#addform").onsubmit = async (ev) => {
   ev.preventDefault();
   const input = $("#src").value.trim();
   if (!input) return;
+  const btn = $("#addform button[type='submit']");
+  const srcInput = $("#src");
+  btn.disabled = true;
+  srcInput.disabled = true;
   $("#msg").textContent = "Adding…";
   try {
     const e = await invoke("install_extension", { input });
     $("#msg").textContent = `Added ${e.name}.` + (e.active ? " Reload open tabs to use it." : "");
-    $("#src").value = "";
+    srcInput.value = "";
   } catch (err) {
     $("#msg").textContent = String(err);
+  } finally {
+    btn.disabled = false;
+    srcInput.disabled = false;
   }
   load();
 };

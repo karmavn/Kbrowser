@@ -160,11 +160,11 @@ async function loadHistory() {
   const q = $("#hq").value;
   const items = await invoke("history_list", { query: q });
   const root = $("#hlist");
-  root.replaceChildren();
   const empty = $("#hempty");
   empty.hidden = items.length > 0;
   empty.textContent = q.trim() ? "No matching history." : "No browsing history yet.";
 
+  const frag = document.createDocumentFragment();
   let lastDay = "";
   for (const e of items) {
     const day = dayLabel(e.time);
@@ -173,7 +173,7 @@ async function loadHistory() {
       const h = document.createElement("h4");
       h.className = "day";
       h.textContent = day;
-      root.append(h);
+      frag.append(h);
     }
     const d = describe(e);
     const row = document.createElement("div");
@@ -196,15 +196,24 @@ async function loadHistory() {
     rm.title = "Remove from history";
     rm.setAttribute("aria-label", "Remove from history");
     rm.innerHTML = '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>';
-    rm.onclick = () => invoke("history_remove", { time: e.time, url: e.url });
+    rm.onclick = () => {
+      // Optimistic UI removal: remove row immediately without waiting for disk flush
+      row.remove();
+      invoke("history_remove", { time: e.time, url: e.url });
+      if (!root.querySelector(".hrow")) {
+        root.replaceChildren();
+        empty.hidden = false;
+      }
+    };
 
     row.append(main, rm);
-    root.append(row);
+    frag.append(row);
   }
+  root.replaceChildren(frag);
 }
 
 let timer;
-$("#hq").oninput = () => { clearTimeout(timer); timer = setTimeout(loadHistory, 150); };
+$("#hq").oninput = () => { clearTimeout(timer); timer = setTimeout(loadHistory, 200); };
 
 $("#clear").onclick = () => $("#dlg").showModal();
 $("#dlg-cancel").onclick = () => $("#dlg").close();
@@ -218,8 +227,8 @@ $("#dlg-ok").onclick = async () => {
 async function loadExts() {
   const exts = await invoke("list_extensions");
   const root = $("#xlist");
-  root.replaceChildren();
   $("#xmsg").textContent = exts.length ? "" : "No extensions installed.";
+  const frag = document.createDocumentFragment();
   for (const e of exts) {
     const card = document.createElement("div");
     card.className = "card";
@@ -245,8 +254,9 @@ async function loadExts() {
     };
 
     card.append(label, btn);
-    root.append(card);
+    frag.append(card);
   }
+  root.replaceChildren(frag);
 }
 
 $("#store").onclick = () => invoke("open_page", { url: "https://chromewebstore.google.com/" });
@@ -258,18 +268,27 @@ listen("settings-changed", ({ payload }) => { settings = payload; syncControls()
 listen("history-updated", () => { if (!$("#pane-privacy").hidden) loadHistory(); });
 
 (async () => {
-  // fetch settings from json
-  settings = await invoke("get_settings");
-  syncControls();
-  $("#wv").textContent = await invoke("about_webview");
+  // Fetch initial settings, webview version, and app version in parallel
+  const [initSettings, wvVersion, appVersion] = await Promise.all([
+    invoke("get_settings").catch(() => null),
+    invoke("about_webview").catch(() => "unknown"),
+    (async () => {
+      try {
+        const { getVersion } = window.__TAURI__.app;
+        return await getVersion();
+      } catch {
+        return "";
+      }
+    })(),
+  ]);
 
-  // try to get app version if version field is loaded
-  try {
-    const { getVersion } = window.__TAURI__.app; 
-    const version = await getVersion();
-    const versionExists = $("#kbrowser-version");
-    if (versionExists) versionExists.innerText = version;
-  } catch (error) {
-    console.error("Failed to load app version:", error);
+  if (initSettings) {
+    settings = initSettings;
+    syncControls();
+  }
+  $("#wv").textContent = wvVersion;
+  const versionExists = $("#kbrowser-version");
+  if (versionExists && appVersion) {
+    versionExists.innerText = appVersion;
   }
 })();

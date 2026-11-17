@@ -79,16 +79,36 @@ fn encode(s: &str) -> String {
     out
 }
 
+/// Fast check for well-known search engine host names without heap allocations.
+fn is_known_search_host(host: &str) -> bool {
+    const KNOWN: &[&str] = &["duckduckgo.com", "bing.com", "brave.com", "ecosia.org"];
+    for &d in KNOWN {
+        if host == d
+            || (host.ends_with(d) && host.as_bytes().get(host.len() - d.len() - 1) == Some(&b'.'))
+        {
+            return true;
+        }
+    }
+    host.starts_with("www.google.") || host.starts_with("google.")
+}
+
 /// The search terms if `url` is a results page of a well-known search engine.
 fn search_query(url: &str) -> Option<String> {
+    // Fast rejection checks on raw string before expensive Url::parse
+    if !url.contains("q=") {
+        return None;
+    }
+    if !url.contains("duckduckgo.com")
+        && !url.contains("google.")
+        && !url.contains("bing.com")
+        && !url.contains("brave.com")
+        && !url.contains("ecosia.org")
+    {
+        return None;
+    }
     let u = Url::parse(url).ok()?;
     let host = u.host_str()?;
-    let known = ["duckduckgo.com", "bing.com", "brave.com", "ecosia.org"]
-        .iter()
-        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
-        || host.starts_with("www.google.")
-        || host.starts_with("google.");
-    if !known {
+    if !is_known_search_host(host) {
         return None;
     }
     u.query_pairs()
@@ -138,10 +158,14 @@ impl Data {
         let Ok(text) = serde_json::to_vec(value) else {
             return;
         };
-        let tmp = dir.join(format!("{name}.tmp"));
-        if fs::write(&tmp, text).is_ok() {
-            let _ = fs::rename(&tmp, dir.join(name));
-        }
+        let dir = dir.clone();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            let tmp = dir.join(format!("{name}.{}.tmp", now()));
+            if fs::write(&tmp, text).is_ok() {
+                let _ = fs::rename(&tmp, dir.join(name));
+            }
+        });
     }
 
     // --- Settings -------------------------------------------------------------
@@ -239,15 +263,14 @@ impl Data {
     /// Newest first, optionally filtered by title or URL.
     pub fn history(&self, query: &str) -> Vec<Entry> {
         let q = query.trim().to_lowercase();
-        self.history
-            .lock()
-            .unwrap()
-            .iter()
+        let h = self.history.lock().unwrap();
+        if q.is_empty() {
+            return h.iter().rev().take(1000).cloned().collect();
+        }
+        h.iter()
             .rev()
             .filter(|e| {
-                q.is_empty()
-                    || e.title.to_lowercase().contains(&q)
-                    || e.url.to_lowercase().contains(&q)
+                e.title.to_lowercase().contains(&q) || e.url.to_lowercase().contains(&q)
             })
             .take(1000)
             .cloned()
@@ -262,23 +285,51 @@ impl Data {
         }
         let mut seen = std::collections::HashSet::new();
         let mut out = vec![];
-        for e in self.history.lock().unwrap().iter().rev() {
+        let history = self.history.lock().unwrap();
+
+        for e in history.iter().rev() {
             let sq = search_query(&e.url);
-            let (key, hay) = match &sq {
-                Some(t) => (format!("q:{}", t.to_lowercase()), t.to_lowercase()),
-                None => (
-                    e.url.clone(),
-                    format!("{} {}", e.title, e.url).to_lowercase(),
-                ),
-            };
-            if !hay.contains(&q) || !seen.insert(key) {
-                continue;
+            match sq {
+                Some(ref t) => {
+                    let t_lower = t.to_lowercase();
+                    if !t_lower.contains(&q) {
+                        continue;
+                    }
+                    let key = format!("q:{t_lower}");
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    out.push(Suggestion {
+                        url: e.url.clone(),
+                        title: e.title.clone(),
+                        query: sq,
+                    });
+                }
+                None => {
+                    if seen.contains(&e.url) {
+                        continue;
+                    }
+                    let title_lower = e.title.to_lowercase();
+                    let url_lower = e.url.to_lowercase();
+                    let matches = if title_lower.contains(&q) || url_lower.contains(&q) {
+                        true
+                    } else if q.contains(' ') {
+                        format!("{title_lower} {url_lower}").contains(&q)
+                    } else {
+                        false
+                    };
+
+                    if !matches || !seen.insert(e.url.clone()) {
+                        continue;
+                    }
+
+                    out.push(Suggestion {
+                        url: e.url.clone(),
+                        title: e.title.clone(),
+                        query: None,
+                    });
+                }
             }
-            out.push(Suggestion {
-                url: e.url.clone(),
-                title: e.title.clone(),
-                query: sq,
-            });
             if out.len() >= limit {
                 break;
             }
@@ -310,3 +361,230 @@ impl Data {
         self.save("history.json", &*h);
     }
 }
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    #[test]
+    fn test_settings_default() {
+        let s = Settings::default();
+        assert_eq!(s.theme, "system");
+        assert_eq!(s.search, "duckduckgo");
+        assert_eq!(s.home, "about:new");
+        assert!(s.save_history);
+        assert!(s.show_suggestions);
+        assert!(!s.save_session);
+    }
+
+    #[test]
+    fn test_settings_validation() {
+        let data = Data::load(None);
+        let mut s = Settings::default();
+        s.theme = "invalid_theme".into();
+        s.home = "   ".into();
+        s.search = "nonexistent".into();
+        s.custom_engines.push(Engine {
+            id: "".into(),
+            name: "bad".into(),
+            url: "invalid".into(),
+        });
+        s.custom_engines.push(Engine {
+            id: "gh".into(),
+            name: "GitHub".into(),
+            url: "https://github.com/search?q=%s".into(),
+        });
+
+        let saved = data.set_settings(s);
+        assert_eq!(saved.theme, "system");
+        assert_eq!(saved.home, DEFAULT_HOME);
+        assert_eq!(saved.search, "duckduckgo");
+        assert_eq!(saved.custom_engines.len(), 1);
+        assert_eq!(saved.custom_engines[0].id, "gh");
+    }
+
+    #[test]
+    fn test_search_url() {
+        let data = Data::load(None);
+        let u1 = data.search_url("hello world");
+        assert_eq!(u1, "https://duckduckgo.com/?q=hello+world");
+
+        let mut s = Settings::default();
+        s.search = "google".into();
+        data.set_settings(s);
+        let u2 = data.search_url("rust async");
+        assert_eq!(u2, "https://www.google.com/search?q=rust+async");
+
+        let mut s = Settings::default();
+        s.custom_engines.push(Engine {
+            id: "yt".into(),
+            name: "YouTube".into(),
+            url: "https://www.youtube.com/results?search_query=%s".into(),
+        });
+        s.search = "yt".into();
+        data.set_settings(s);
+        let u3 = data.search_url("tauri v2");
+        assert_eq!(u3, "https://www.youtube.com/results?search_query=tauri+v2");
+    }
+
+    #[test]
+    fn test_search_query_extraction() {
+        assert_eq!(
+            search_query("https://duckduckgo.com/?q=weather+today"),
+            Some("weather today".into())
+        );
+        assert_eq!(
+            search_query("https://www.google.com/search?q=rust+lang&hl=en"),
+            Some("rust lang".into())
+        );
+        assert_eq!(
+            search_query("https://www.bing.com/search?q=tauri"),
+            Some("tauri".into())
+        );
+        assert_eq!(
+            search_query("https://search.brave.com/search?q=privacy"),
+            Some("privacy".into())
+        );
+        assert_eq!(
+            search_query("https://www.ecosia.org/search?q=trees"),
+            Some("trees".into())
+        );
+        assert_eq!(search_query("https://example.com/?q=test"), None);
+    }
+
+    #[test]
+    fn test_history_dedupe_and_suggest() {
+        let data = Data::load(None);
+        assert!(data.add_history("https://duckduckgo.com/?q=rust", "DuckDuckGo"));
+        // Second visit within dedupe window updates title
+        assert!(data.add_history("https://duckduckgo.com/?q=rust", "DuckDuckGo - rust"));
+        assert_eq!(data.history("").len(), 1);
+        assert_eq!(data.history("")[0].title, "DuckDuckGo - rust");
+
+        data.add_history("https://github.com/tauri-apps/tauri", "GitHub - tauri-apps/tauri");
+        data.add_history("https://crates.io/crates/tauri", "tauri - crates.io");
+
+        let suggestions = data.suggest("tauri", 5);
+        assert_eq!(suggestions.len(), 2);
+        assert_eq!(suggestions[0].url, "https://crates.io/crates/tauri");
+        assert_eq!(suggestions[1].url, "https://github.com/tauri-apps/tauri");
+
+        let search_suggestions = data.suggest("rust", 5);
+        assert_eq!(search_suggestions.len(), 1);
+        assert_eq!(search_suggestions[0].query, Some("rust".into()));
+    }
+
+    #[test]
+    fn bench_and_fingerprint() {
+        use sha2::{Sha256, Digest};
+        use std::time::Instant;
+
+        let data = Data::load(None);
+
+        // Populate realistic 5000 history entries
+        {
+            let mut h = data.history.lock().unwrap();
+            for i in 0..5000 {
+                let entry = match i % 5 {
+                    0 => Entry {
+                        url: format!("https://duckduckgo.com/?q=query+term+{}", i % 50),
+                        title: format!("Search results for query term {}", i % 50),
+                        time: 1700000000000 + i as u64 * 1000,
+                    },
+                    1 => Entry {
+                        url: format!("https://www.google.com/search?q=rust+language+topic+{}", i % 30),
+                        title: format!("Google Search - rust topic {}", i % 30),
+                        time: 1700000000000 + i as u64 * 1000,
+                    },
+                    2 => Entry {
+                        url: format!("https://crates.io/crates/package-{}", i % 200),
+                        title: format!("package-{} - crates.io: Rust Package Registry", i % 200),
+                        time: 1700000000000 + i as u64 * 1000,
+                    },
+                    3 => Entry {
+                        url: format!("https://github.com/developer/repo-{}", i % 100),
+                        title: format!("developer/repo-{} on GitHub", i % 100),
+                        time: 1700000000000 + i as u64 * 1000,
+                    },
+                    _ => Entry {
+                        url: format!("https://docs.rs/library-{}/0.1.0/library/index.html", i % 80),
+                        title: format!("library-{} - Rust docs", i % 80),
+                        time: 1700000000000 + i as u64 * 1000,
+                    },
+                };
+                h.push(entry);
+            }
+        }
+
+        // Benchmark suggest across 100 queries
+        let query_list = [
+            "rust", "query", "google", "crates", "repo", "library", "package", "search", "topic", "index"
+        ];
+
+        let start_suggest = Instant::now();
+        let mut total_suggestions = 0;
+        for _ in 0..10 {
+            for q in &query_list {
+                let res = data.suggest(q, 6);
+                total_suggestions += res.len();
+            }
+        }
+        let elapsed_suggest = start_suggest.elapsed();
+
+        // Benchmark history filter across 50 queries
+        let start_history = Instant::now();
+        let mut total_history = 0;
+        for _ in 0..5 {
+            for q in &query_list {
+                let res = data.history(q);
+                total_history += res.len();
+            }
+        }
+        let elapsed_history = start_history.elapsed();
+
+        // Compute SHA-256 fingerprints
+        let fp_search = {
+            let res = data.search_url("how to optimize rust");
+            let mut hasher = Sha256::new();
+            hasher.update(res.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
+        let fp_suggest = {
+            let res = data.suggest("rust", 6);
+            let json = serde_json::to_string(&res).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(json.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
+        let fp_history = {
+            let res = data.history("crates");
+            let json = serde_json::to_string(&res).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(json.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
+        let fp_settings = {
+            let res = data.settings();
+            let json = serde_json::to_string(&res).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(json.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
+        println!("\n=== BENCHMARK_RESULTS ===");
+        println!("SUGGEST_TIME_MICROS: {}", elapsed_suggest.as_micros());
+        println!("SUGGEST_COUNT: {}", total_suggestions);
+        println!("HISTORY_TIME_MICROS: {}", elapsed_history.as_micros());
+        println!("HISTORY_COUNT: {}", total_history);
+        println!("FP_SEARCH_URL: {}", fp_search);
+        println!("FP_SUGGEST_RUST: {}", fp_suggest);
+        println!("FP_HISTORY_CRATES: {}", fp_history);
+        println!("FP_SETTINGS: {}", fp_settings);
+        println!("=== END_BENCHMARK_RESULTS ===\n");
+    }
+}
+
+

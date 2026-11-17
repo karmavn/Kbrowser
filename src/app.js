@@ -143,32 +143,58 @@ async function closeTab(id) {
 
 function render() {
   const root = $("#tabs");
-  root.replaceChildren();
-  for (const [id, t] of tabs) {
-    const el = document.createElement("div");
-    el.className = "tab" + (id === active ? " active" : "");
-    el.setAttribute("role", "tab");
-    el.title = t.title;
+  const currentEls = Array.from(root.children);
+  const currentIds = currentEls.map((el) => el.dataset.id);
+  const targetIds = Array.from(tabs.keys());
 
-    const title = document.createElement("span");
-    title.className = "title";
-    title.textContent = t.title;
+  const sameIds = currentIds.length === targetIds.length && currentIds.every((id, i) => id === targetIds[i]);
 
-    const x = document.createElement("button");
-    x.className = "close icon";
-    x.setAttribute("aria-label", "Close tab");
-    x.innerHTML = CLOSE_SVG;
-    x.onclick = (e) => { e.stopPropagation(); closeTab(id); };
+  if (sameIds) {
+    // Fast path: update attributes and text in place without destroying DOM elements
+    for (let i = 0; i < currentEls.length; i++) {
+      const el = currentEls[i];
+      const id = targetIds[i];
+      const t = tabs.get(id);
+      const isActive = id === active;
+      const expectedClass = "tab" + (isActive ? " active" : "");
+      if (el.className !== expectedClass) el.className = expectedClass;
+      if (el.title !== t.title) {
+        el.title = t.title;
+        const titleSpan = el.firstElementChild;
+        if (titleSpan && titleSpan.textContent !== t.title) titleSpan.textContent = t.title;
+      }
+    }
+  } else {
+    // Structural change: build with DocumentFragment for single reflow
+    const frag = document.createDocumentFragment();
+    for (const [id, t] of tabs) {
+      const el = document.createElement("div");
+      el.dataset.id = id;
+      el.className = "tab" + (id === active ? " active" : "");
+      el.setAttribute("role", "tab");
+      el.title = t.title;
 
-    el.append(title, x);
-    el.onclick = () => activate(id);
-    el.onauxclick = (e) => { if (e.button === 1) closeTab(id); };
-    root.append(el);
+      const title = document.createElement("span");
+      title.className = "title";
+      title.textContent = t.title;
+
+      const x = document.createElement("button");
+      x.className = "close icon";
+      x.setAttribute("aria-label", "Close tab");
+      x.innerHTML = CLOSE_SVG;
+      x.onclick = (e) => { e.stopPropagation(); closeTab(id); };
+
+      el.append(title, x);
+      el.onclick = () => activate(id);
+      el.onauxclick = (e) => { if (e.button === 1) closeTab(id); };
+      frag.append(el);
+    }
+    root.replaceChildren(frag);
   }
+
   const t = tabs.get(active);
   $("#progress").classList.toggle("on", !!t?.loading);
   if (document.activeElement !== $("#addr")) $("#addr").value = shown(t?.url);
-  $("#add").hidden = !storeId(t?.url);
   $("#add").hidden = !storeId(t?.url);
   saveSession();
 }
@@ -330,7 +356,7 @@ async function updateSuggest() {
 //address bar
 const addr = $("#addr");
 addr.onfocus = () => addr.select();
-addr.oninput = () => { clearTimeout(suggestTimer); suggestTimer = setTimeout(updateSuggest, 60); };
+addr.oninput = () => { clearTimeout(suggestTimer); suggestTimer = setTimeout(updateSuggest, 150); };
 addr.onblur = () => closeSuggest();
 addr.onkeydown = (e) => {
   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -386,21 +412,26 @@ window.addEventListener("resize", syncMax); // the UI webview resizes with the w
 syncMax();
 
 (async () => {
-  try { settings = {...settings, ...(await invoke("get_settings"))}; } catch {}
-  applyTheme();
-  try { if (await invoke("has_mica")) document.documentElement.classList.add("mica"); } catch {}
+  const [initSettings, hasMica, launchUrl, initSession] = await Promise.all([
+    invoke("get_settings").catch(() => null),
+    invoke("has_mica").catch(() => false),
+    invoke("take_launch_url").catch(() => null),
+    invoke("load_session").catch(() => null),
+  ]);
 
-  let launch, session;
-  try { launch = await invoke("take_launch_url"); } catch {}
-  if (settings.save_session)
-    try { session = await invoke("load_session"); } catch {}
+  if (initSettings) settings = { ...settings, ...initSettings };
+  applyTheme();
+  if (hasMica) document.documentElement.classList.add("mica");
+
+  const session = settings.save_session ? initSession : null;
+  const launch = launchUrl;
 
   // Reopen the previous tabs one after another (parallel webview creation is risky).
   for (const u of session?.tabs ?? []) await openTab(u);
   const ids = [...tabs.keys()];
   if (ids.length) activate(ids[Math.min(session?.active ?? 0, ids.length - 1)]);
 
-   //protects from bad cli launch url, opens with home tab.
+  // protects from bad cli launch url, opens with home tab.
   if (launch) await openTab(launch ?? undefined);
   else if (!ids.length) await openTab(); // nothing to restore: home page
 

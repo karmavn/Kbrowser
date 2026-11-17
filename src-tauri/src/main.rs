@@ -720,3 +720,35 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running Kbrowser");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize() {
+        let data = data::Data::load(None);
+        assert_eq!(normalize("https://example.com", &data), "https://example.com");
+        assert_eq!(normalize("http://example.com/foo", &data), "http://example.com/foo");
+        assert_eq!(normalize("localhost:3000", &data), "http://localhost:3000");
+        assert_eq!(normalize("github.com", &data), "https://github.com");
+        assert_eq!(normalize("what is rust", &data), "https://duckduckgo.com/?q=what+is+rust");
+    }
+
+    #[test]
+    fn test_url_from_args() {
+        let args = vec![
+            "kbrowser.exe".into(),
+            "https://tauri.app".into(),
+        ];
+        assert_eq!(url_from_args(&args, None), Some("https://tauri.app/".into()));
+
+        let args_flag = vec![
+            "kbrowser.exe".into(),
+            "--devtools".into(),
+            "https://crates.io".into(),
+        ];
+        assert_eq!(url_from_args(&args_flag, None), Some("https://crates.io/".into()));
+    }
+}
+
