@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[cfg(not(windows))]
-compile_error!("WebViewer2 requires Windows WebView2.");
+compile_error!("Kbrowser requires Windows WebView2.");
 
 mod data;
 mod live;
@@ -320,7 +320,6 @@ async fn new_tab(app: AppHandle, id: String, url: String) -> Result<(), String> 
         "about:extensions" => WebviewUrl::App("extensions.html".into()),
         "about:settings" => WebviewUrl::App("settings.html".into()),
         "about:new" => WebviewUrl::App("new.html".into()),
-        "about:licenses" => WebviewUrl::App("licenses.html".into()),
         _ => {
             let data = app.state::<data::Data>();
             WebviewUrl::External(
@@ -665,7 +664,7 @@ fn main() {
             app.manage(SessionState(std::sync::Mutex::new(session)));
 
             let window = WindowBuilder::new(app, "main")
-                .title("WebViewer2")
+                .title("Kbrowser")
                 .inner_size(1200.0, 800.0)
                 .min_inner_size(640.0, 400.0)
                 // Hidden until position/size are restored, so it doesn't flash at the default spot.
@@ -719,5 +718,5 @@ fn main() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running WebViewer2");
+        .expect("error while running Kbrowser");
 }

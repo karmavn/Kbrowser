@@ -1,4 +1,4 @@
-# WebViewer2
+# Kbrowser
 ### Project Overview
 This is a simple, multi-tabbed browser, written with Rust in the Tauri framework. It utilizes [Microsoft WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2) for displaying web content. \
 Because of this, it is much more RAM-Efficient than a conventional browser on Windows.
@@ -8,7 +8,7 @@ Chrome web extensions are supported. For this, about:extensions serves as a hub.
 Important: Do not press the Chrome Web store's install button, as this will fail.
 Additionally, you can toggle session persistence, which saves your open tabs and reopens them on reboot.\
 Finally, the browser has cli support to enable development work, as well as the WebView2 development console.\
-the syntax for the cli is as follows: "WebViewer2.exe example.com". \
+the syntax for the cli is as follows: "Kbrowser.exe example.com". \
 To open the development console, use the shortcut "ctrl+shift+i".
 ### Requirements
 As of now, this project requires both WebView2 as well as Windows 10/11 64bit.

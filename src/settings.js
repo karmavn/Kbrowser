@@ -251,9 +251,6 @@ async function loadExts() {
 
 $("#store").onclick = () => invoke("open_page", { url: "https://chromewebstore.google.com/" });
 $("#manage").onclick = () => invoke("open_page", { url: "about:extensions" });
-$("#show-licenses").onclick = () => invoke("open_page", { url: "about:licenses" });
-
-// ---------- Events + startup ----------
 
 // ---------- Events + startup ----------
 
@@ -270,7 +267,7 @@ listen("history-updated", () => { if (!$("#pane-privacy").hidden) loadHistory();
   try {
     const { getVersion } = window.__TAURI__.app; 
     const version = await getVersion();
-    const versionExists = $("#webviewer2-version");
+    const versionExists = $("#kbrowser-version");
     if (versionExists) versionExists.innerText = version;
   } catch (error) {
     console.error("Failed to load app version:", error);
