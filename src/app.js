@@ -82,62 +82,45 @@ async function closeTab(id) {
     return;
   }
 
-  closingTabs.add(id);
-
-  // Finish destroying the native webview before changing lifecycle state.
-  try {
-    await invoke("close_tab", { id });
-  } catch (e) {
-    console.error("close_tab failed:", e);
-    closingTabs.delete(id);
-    return;
-  }
-
-  closingTabs.delete(id);
-
-  // Re-read the current tabs after the async operation.
   const ids = [...tabs.keys()];
   const idx = ids.indexOf(id);
-
-  // Another operation may already have removed this tab.
   if (idx === -1) return;
 
+  closingTabs.add(id);
   const wasActive = active === id;
-
   tabs.delete(id);
-
   const remaining = [...tabs.keys()];
 
   if (wasActive) {
-    active =
-      remaining[Math.min(idx, remaining.length - 1)] ?? null;
+    active = remaining[Math.min(idx, remaining.length - 1)] ?? null;
   }
 
+  // Optimistic UI: tab closes immediately with zero click delay
   render();
 
-  // There is nothing left to display: shut down the application.
   if (tabs.size === 0) {
     shuttingDown = true;
-
     try {
-      //save session before closing app
       await invoke("save_tabs", { tabs: [], active: 0 });
       await invoke("exit_app");
     } catch (e) {
       shuttingDown = false;
       console.error("exit_app failed:", e);
     }
-
     return;
   }
 
-  // Activate the replacement only after the previous tab has closed.
   if (wasActive && active) {
-    try {
-      await invoke("activate_tab", { id: active });
-    } catch (e) {
-      console.error("activate_tab failed:", e);
-    }
+    invoke("activate_tab", { id: active }).catch(() => {});
+  }
+
+  // Destroy the native webview asynchronously in the background
+  try {
+    await invoke("close_tab", { id });
+  } catch (e) {
+    console.error("close_tab failed:", e);
+  } finally {
+    closingTabs.delete(id);
   }
 }
 

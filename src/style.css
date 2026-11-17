@@ -166,7 +166,7 @@ html.mica { background: transparent; color-scheme: normal !important; }
 #addr::placeholder { color: var(--fg3); }
 #addr:focus { border-bottom: 2px solid var(--brand); padding-bottom: 1px; }
 
-/* Indeterminate progress bar */
+/* Indeterminate progress bar (GPU compositor-accelerated transform) */
 #progress {
   position: fixed;
   left: 0; right: 0; top: 82px; /* just above the bottom edge of the 84px chrome */
@@ -180,15 +180,19 @@ html.mica { background: transparent; color-scheme: normal !important; }
 #progress::after {
   content: "";
   position: absolute;
-  top: 0; bottom: 0; left: -30%;
+  top: 0; bottom: 0; left: 0;
   width: 30%;
   border-radius: 1px;
   background: var(--brand);
   animation: slide 1.4s ease-in-out infinite;
+  will-change: transform;
 }
-@keyframes slide { to { left: 100%; } }
+@keyframes slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
 @media (prefers-reduced-motion: reduce) {
-  #progress::after { animation: none; left: 0; width: 100%; opacity: 0.6; }
+  #progress::after { animation: none; transform: none; left: 0; width: 100%; opacity: 0.6; }
 }
 
 /* Buttons (Fluent 2: primary = brand background, subtle = outline) */
