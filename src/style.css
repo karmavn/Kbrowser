@@ -342,7 +342,10 @@ input.field[type="text"].wide { width: 280px; }
   color: var(--fg3); background: var(--bg3);
 }
 .day:not(:first-child) { border-top: 1px solid var(--stroke2); }
-.hrow { display: flex; align-items: center; gap: 12px; padding: 6px 8px 6px 16px; border-top: 1px solid var(--stroke2); }
+/* content-visibility: the engine skips layout/paint for rows outside the viewport,
+   so a 1,000-row history costs about the same as the ~15 visible rows.
+   `auto 49px` keeps the scrollbar stable (1px border + 12px padding + 36px text). */
+.hrow { display: flex; align-items: center; gap: 12px; padding: 6px 8px 6px 16px; border-top: 1px solid var(--stroke2); content-visibility: auto; contain-intrinsic-size: auto 49px; }
 .day + .hrow { border-top: 0; }
 .hrow:hover { background: var(--hover); }
 .hmain { flex: 1; min-width: 0; display: flex; flex-direction: column; }

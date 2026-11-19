@@ -232,16 +232,43 @@ fn read_session(app: &AppHandle) -> Session {
         .unwrap_or_default()
 }
 
-/// Writes the in-memory session to disk (tmp file + rename, so a crash cannot leave half a file).
+/// Writes the in-memory session to disk asynchronously in a background thread.
 fn persist(app: &AppHandle) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Unique temp names: two saves in the same millisecond must not share a
+    // `.tmp` file (concurrent writes to one path could corrupt the rename).
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let s = app.state::<SessionState>().0.lock().unwrap().clone();
     let Some(path) = session_path(app) else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(json) = serde_json::to_string_pretty(&s) {
+    if let Ok(bytes) = serde_json::to_vec(&s) {
+        let dir = path.parent().map(|p| p.to_path_buf());
+        std::thread::spawn(move || {
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = if let Some(d) = dir {
+                d.join(format!("session.{}.{seq}.tmp", data::now()))
+            } else {
+                path.with_extension("json.tmp")
+            };
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        });
+    }
+}
+
+/// Synchronous write on app shutdown to ensure session data is fully flushed.
+fn persist_sync(app: &AppHandle) {
+    let s = app.state::<SessionState>().0.lock().unwrap().clone();
+    let Some(path) = session_path(app) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(bytes) = serde_json::to_vec(&s) {
         let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
+        if std::fs::write(&tmp, bytes).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
@@ -314,8 +341,10 @@ fn delete_session(app: AppHandle, state: State<'_, SessionState>) -> Result<(), 
         *session_lock = Session::default(); 
     }
 
-    //Overwrite the physical session.json file with the empty baseline data
-    persist(&app);
+    //Overwrite the physical session.json file with the empty baseline data.
+    //Must be synchronous: an async write could land after the remove_file below
+    //and resurrect the file this command is supposed to delete.
+    persist_sync(&app);
 
     //Optional hard-deletion: Clean up the session file completely from the disk
     if let Some(path) = session_path(&app) {
@@ -451,7 +480,7 @@ fn close_tab(app: AppHandle, id: String) -> Result<(), String> {
 ///trigers the closing of the app. This happens for example, when the last tab is closed.
 #[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
-    persist(&app);
+    persist_sync(&app);
     app.exit(0);
 }
 
@@ -634,7 +663,7 @@ async fn open_extension_options(app: AppHandle, id: String) -> Result<(), String
 
 #[tauri::command]
 fn restart_app(app: AppHandle) {
-    persist(&app);
+    persist_sync(&app);
     app.restart();
 }
 
@@ -761,7 +790,7 @@ fn main() {
                 }
                 WindowEvent::CloseRequested { .. } => {
                     track_window(&w);
-                    persist(w.app_handle());
+                    persist_sync(w.app_handle());
                 }
                 _ => {}
             });

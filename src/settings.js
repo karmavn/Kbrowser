@@ -134,12 +134,24 @@ for (const b of navItems) b.onclick = () => show(b.dataset.pane);
 
 // ---------- History ----------
 
-function dayLabel(ms) {
-  const startOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-  const diff = Math.round((startOf(new Date()) - startOf(new Date(ms))) / 86400000);
+const timeFormatter = new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" });
+const dayFormatter = new Intl.DateTimeFormat([], { weekday: "long", month: "long", day: "numeric" });
+
+const RM_SVG_NODE = (() => {
+  const d = document.createElement("div");
+  d.innerHTML = '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+  return d.firstElementChild;
+})();
+
+// todayStart is passed in so a 1,000-row render computes "today" once, and each
+// row reuses one Date (setHours) instead of allocating three plus a closure.
+function dayLabel(ms, todayStart) {
+  const d = new Date(ms);
+  d.setHours(0, 0, 0, 0);
+  const diff = Math.round((todayStart - d.getTime()) / 86400000);
   if (diff === 0) return "Today";
   if (diff === 1) return "Yesterday";
-  return new Date(ms).toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+  return dayFormatter.format(ms);
 }
 
 const SEARCH_HOST = /(^|\.)(duckduckgo\.com|google\.[a-z.]+|bing\.com|brave\.com|ecosia\.org)$/;
@@ -156,18 +168,22 @@ function describe(e) {
   }
 }
 
+let historySeq = 0;
 async function loadHistory() {
+  const seq = ++historySeq;
   const q = $("#hq").value;
   const items = await invoke("history_list", { query: q });
+  if (seq !== historySeq) return; // a newer query already answered: drop stale list
   const root = $("#hlist");
   const empty = $("#hempty");
   empty.hidden = items.length > 0;
   empty.textContent = q.trim() ? "No matching history." : "No browsing history yet.";
 
   const frag = document.createDocumentFragment();
+  const todayStart = new Date().setHours(0, 0, 0, 0);
   let lastDay = "";
   for (const e of items) {
-    const day = dayLabel(e.time);
+    const day = dayLabel(e.time, todayStart);
     if (day !== lastDay) {
       lastDay = day;
       const h = document.createElement("h4");
@@ -188,14 +204,14 @@ async function loadHistory() {
     open.onclick = () => invoke("open_page", { url: e.url });
     const sub = document.createElement("span");
     sub.className = "sub";
-    sub.textContent = `${d.host} · ${new Date(e.time).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+    sub.textContent = `${d.host} · ${timeFormatter.format(e.time)}`;
     main.append(open, sub);
 
     const rm = document.createElement("button");
     rm.className = "icon";
     rm.title = "Remove from history";
     rm.setAttribute("aria-label", "Remove from history");
-    rm.innerHTML = '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+    rm.appendChild(RM_SVG_NODE.cloneNode(true));
     rm.onclick = () => {
       // Optimistic UI removal: remove row immediately without waiting for disk flush
       row.remove();
@@ -265,7 +281,14 @@ $("#manage").onclick = () => invoke("open_page", { url: "about:extensions" });
 // ---------- Events + startup ----------
 
 listen("settings-changed", ({ payload }) => { settings = payload; syncControls(); });
-listen("history-updated", () => { if (!$("#pane-privacy").hidden) loadHistory(); });
+// Debounced: a burst of history-updated events (e.g. several tabs finishing loads,
+// or the echo of our own optimistic removal) coalesces into one list rebuild.
+let historyReloadTimer;
+listen("history-updated", () => {
+  if ($("#pane-privacy").hidden) return;
+  clearTimeout(historyReloadTimer);
+  historyReloadTimer = setTimeout(loadHistory, 150);
+});
 
 (async () => {
   // Fetch initial settings, webview version, and app version in parallel
