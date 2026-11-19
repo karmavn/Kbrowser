@@ -3,6 +3,11 @@ const { listen } = window.__TAURI__.event;
 
 const $ = (s) => document.querySelector(s);
 const CLOSE_SVG = '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+const CLOSE_ICON_NODE = (() => {
+  const d = document.createElement("div");
+  d.innerHTML = CLOSE_SVG;
+  return d.firstElementChild;
+})();
 const INTERNAL = new Set(["about:extensions", "about:settings", "about:new"]);
 
 // Mirrors the Rust `Settings`; replaced by the saved values at startup.
@@ -164,7 +169,7 @@ function render() {
       const x = document.createElement("button");
       x.className = "close icon";
       x.setAttribute("aria-label", "Close tab");
-      x.innerHTML = CLOSE_SVG;
+      x.appendChild(CLOSE_ICON_NODE.cloneNode(true));
       x.onclick = (e) => { e.stopPropagation(); closeTab(id); };
 
       el.append(title, x);
@@ -272,6 +277,16 @@ $("#add").onclick = async () => {
 const ROW_H = 40, PAD = 8;
 const SEARCH_SVG = '<svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>';
 const PAGE_SVG = '<svg viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></svg>';
+const SEARCH_ICON_NODE = (() => {
+  const d = document.createElement("div");
+  d.innerHTML = SEARCH_SVG;
+  return d.firstElementChild;
+})();
+const PAGE_ICON_NODE = (() => {
+  const d = document.createElement("div");
+  d.innerHTML = PAGE_SVG;
+  return d.firstElementChild;
+})();
 let rows = [];
 let sel = -1;
 let suggestTimer = 0;
@@ -292,9 +307,17 @@ function closeSuggest() {
   }
 }
 
+function updateSuggestSelection() {
+  const box = $("#suggest");
+  const children = box.children;
+  for (let i = 0; i < children.length; i++) {
+    children[i].classList.toggle("sel", i === sel);
+  }
+}
+
 function paintSuggest() {
   const box = $("#suggest");
-  box.replaceChildren();
+  const frag = document.createDocumentFragment();
   rows.forEach((r, i) => {
     const el = document.createElement("div");
     el.className = "srow" + (i === sel ? " sel" : "");
@@ -302,7 +325,7 @@ function paintSuggest() {
 
     const ico = document.createElement("span");
     ico.className = "sico";
-    ico.innerHTML = r.query != null ? SEARCH_SVG : PAGE_SVG;
+    ico.appendChild((r.query != null ? SEARCH_ICON_NODE : PAGE_ICON_NODE).cloneNode(true));
 
     const main = document.createElement("span");
     main.className = "smain";
@@ -322,8 +345,9 @@ function paintSuggest() {
     el.append(ico, main);
     // mousedown (not click) so the address box keeps focus and its blur does not close the list first
     el.onmousedown = (e) => { e.preventDefault(); pick(r); };
-    box.append(el);
+    frag.append(el);
   });
+  box.replaceChildren(frag);
 }
 
 function pick(r) {
@@ -366,7 +390,7 @@ addr.onkeydown = (e) => {
     e.preventDefault();
     const n = rows.length;
     sel = e.key === "ArrowDown" ? (sel + 1) % n : (sel - 1 + n) % n;
-    paintSuggest();
+    updateSuggestSelection();
   } else if (e.key === "Enter" && active && addr.value.trim()) {
     if (sel >= 0 && rows[sel]) return pick(rows[sel]);
     const v = addr.value.trim();
@@ -395,6 +419,16 @@ window.addEventListener("keydown", (e) => {
 // Custom window frame: drag is handled natively by data-tauri-drag-region, double-click to maximize.
 const MAX_SVG = '<svg viewBox="0 0 10 10"><path d="M.5.5h9v9h-9z"/></svg>';
 const RESTORE_SVG = '<svg viewBox="0 0 10 10"><path d="M2.5 2.5v-2h7v7h-2M.5 2.5h7v7h-7z"/></svg>';
+const MAX_ICON_NODE = (() => {
+  const d = document.createElement("div");
+  d.innerHTML = MAX_SVG;
+  return d.firstElementChild;
+})();
+const RESTORE_ICON_NODE = (() => {
+  const d = document.createElement("div");
+  d.innerHTML = RESTORE_SVG;
+  return d.firstElementChild;
+})();
 $("#strip").addEventListener("dblclick", (e) => {
   if (e.target.closest(".tab, button")) return;
   invoke("win_toggle_maximize");
@@ -403,10 +437,13 @@ $("#strip").addEventListener("dblclick", (e) => {
 $("#win-min").onclick = () => invoke("win_minimize");
 $("#win-max").onclick = () => invoke("win_toggle_maximize");
 $("#win-close").onclick = () => invoke("win_close");
+let lastMax = null;
 async function syncMax() {
   const max = await invoke("win_is_maximized");
+  if (max === lastMax) return; // unchanged: skip the DOM write on every resize tick
+  lastMax = max;
   const b = $("#win-max");
-  b.innerHTML = max ? RESTORE_SVG : MAX_SVG;
+  b.replaceChildren((max ? RESTORE_ICON_NODE : MAX_ICON_NODE).cloneNode(true));
   b.title = max ? "Restore" : "Maximize";
   b.setAttribute("aria-label", b.title);
 }

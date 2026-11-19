@@ -56,6 +56,11 @@ pub struct Entry {
     pub title: String,
     /// Milliseconds since the Unix epoch.
     pub time: u64,
+    /// Cached `search_query(url)`, computed once when the entry is created or loaded
+    /// instead of on every address-bar keystroke. Skipped by serde, so the persisted
+    /// JSON and the `history_list` IPC response keep exactly the same shape.
+    #[serde(skip)]
+    sq: Option<String>,
 }
 
 pub struct Data {
@@ -66,6 +71,7 @@ pub struct Data {
 
 /// Percent-encodes search terms for a query string (spaces become `+`).
 fn encode(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::new();
     for b in s.bytes() {
         match b {
@@ -73,7 +79,11 @@ fn encode(s: &str) -> String {
                 out.push(b as char)
             }
             b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 15) as usize] as char);
+            }
         }
     }
     out
@@ -126,7 +136,7 @@ pub struct Suggestion {
     pub query: Option<String>,
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -142,9 +152,13 @@ impl Data {
         let settings: Settings = read("settings.json")
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
-        let history: Vec<Entry> = read("history.json")
+        let mut history: Vec<Entry> = read("history.json")
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
+        // Parse each URL once at load time; suggest() then never re-parses.
+        for e in &mut history {
+            e.sq = search_query(&e.url);
+        }
         Self {
             dir,
             settings: Mutex::new(settings),
@@ -153,6 +167,10 @@ impl Data {
     }
 
     fn save<T: Serialize>(&self, name: &str, value: &T) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Unique temp names: two saves in the same millisecond must not share a
+        // `.tmp` file (concurrent writes to one path could corrupt the rename).
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let Some(dir) = &self.dir else { return };
         let _ = fs::create_dir_all(dir);
         let Ok(text) = serde_json::to_vec(value) else {
@@ -161,7 +179,8 @@ impl Data {
         let dir = dir.clone();
         let name = name.to_string();
         std::thread::spawn(move || {
-            let tmp = dir.join(format!("{name}.{}.tmp", now()));
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = dir.join(format!("{name}.{}.{seq}.tmp", now()));
             if fs::write(&tmp, text).is_ok() {
                 let _ = fs::rename(&tmp, dir.join(name));
             }
@@ -252,11 +271,16 @@ impl Data {
                 url: url.to_string(),
                 title: title.to_string(),
                 time: t,
+                sq: search_query(url),
             });
             let extra = h.len().saturating_sub(MAX_HISTORY);
             h.drain(..extra);
         }
-        self.save("history.json", &*h);
+        // Serialize outside the history lock so suggest()/history() are not blocked
+        // by the JSON encoding of up to 5,000 entries on every page visit.
+        let snapshot = h.clone();
+        drop(h);
+        self.save("history.json", &snapshot);
         true
     }
 
@@ -264,16 +288,24 @@ impl Data {
     pub fn history(&self, query: &str) -> Vec<Entry> {
         let q = query.trim().to_lowercase();
         let h = self.history.lock().unwrap();
+        // Output entries are built field-by-field: the cached query is serde-skipped
+        // anyway, and skipping it here avoids cloning its String for every row.
+        let out = |e: &Entry| Entry {
+            url: e.url.clone(),
+            title: e.title.clone(),
+            time: e.time,
+            sq: None,
+        };
         if q.is_empty() {
-            return h.iter().rev().take(1000).cloned().collect();
+            return h.iter().rev().take(1000).map(out).collect();
         }
+        // std's to_lowercase has a tight ASCII fast path; measured faster than
+        // buffer-reuse variants in debug (see OPTIMIZE_REPORT.md).
         h.iter()
             .rev()
-            .filter(|e| {
-                e.title.to_lowercase().contains(&q) || e.url.to_lowercase().contains(&q)
-            })
+            .filter(|e| e.title.to_lowercase().contains(&q) || e.url.to_lowercase().contains(&q))
             .take(1000)
-            .cloned()
+            .map(out)
             .collect()
     }
 
@@ -283,46 +315,44 @@ impl Data {
         if q.is_empty() {
             return vec![];
         }
-        let mut seen = std::collections::HashSet::new();
+        // Separate sets for URLs and search terms: no `format!("q:...")` key allocation,
+        // and a query can never collide with a URL.
+        let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_queries: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out = vec![];
         let history = self.history.lock().unwrap();
 
         for e in history.iter().rev() {
-            let sq = search_query(&e.url);
-            match sq {
-                Some(ref t) => {
+            // e.sq was parsed once when the entry was created/loaded: no Url::parse here.
+            match e.sq.as_ref() {
+                Some(t) => {
                     let t_lower = t.to_lowercase();
                     if !t_lower.contains(&q) {
                         continue;
                     }
-                    let key = format!("q:{t_lower}");
-                    if !seen.insert(key) {
+                    if seen_queries.contains(t_lower.as_str()) {
                         continue;
                     }
+                    seen_queries.insert(t_lower);
                     out.push(Suggestion {
                         url: e.url.clone(),
                         title: e.title.clone(),
-                        query: sq,
+                        query: Some(t.clone()),
                     });
                 }
                 None => {
-                    if seen.contains(&e.url) {
+                    if seen_urls.contains(&e.url) {
                         continue;
                     }
                     let title_lower = e.title.to_lowercase();
                     let url_lower = e.url.to_lowercase();
-                    let matches = if title_lower.contains(&q) || url_lower.contains(&q) {
-                        true
-                    } else if q.contains(' ') {
-                        format!("{title_lower} {url_lower}").contains(&q)
-                    } else {
-                        false
-                    };
-
-                    if !matches || !seen.insert(e.url.clone()) {
+                    let matches = title_lower.contains(&q)
+                        || url_lower.contains(&q)
+                        || (q.contains(' ') && format!("{title_lower} {url_lower}").contains(&q));
+                    if !matches {
                         continue;
                     }
-
+                    seen_urls.insert(e.url.clone());
                     out.push(Suggestion {
                         url: e.url.clone(),
                         title: e.title.clone(),
@@ -340,7 +370,9 @@ impl Data {
     pub fn remove(&self, time: u64, url: &str) {
         let mut h = self.history.lock().unwrap();
         h.retain(|e| !(e.time == time && e.url == url));
-        self.save("history.json", &*h);
+        let snapshot = h.clone();
+        drop(h);
+        self.save("history.json", &snapshot);
     }
 
     /// range: "hour" | "day" | "week" | anything else = everything.
@@ -358,7 +390,9 @@ impl Data {
             let cutoff = now().saturating_sub(span);
             h.retain(|e| e.time < cutoff);
         }
-        self.save("history.json", &*h);
+        let snapshot = h.clone();
+        drop(h);
+        self.save("history.json", &snapshot);
     }
 }
 
@@ -475,6 +509,54 @@ pub mod tests {
     }
 
     #[test]
+    fn test_entry_json_shape_unchanged() {
+        // The cached query must never leak into persisted JSON or IPC responses.
+        let e = Entry {
+            url: "https://example.com/".into(),
+            title: "Example".into(),
+            time: 1700000000000,
+            sq: Some("ignored".into()),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(
+            json,
+            r#"{"url":"https://example.com/","title":"Example","time":1700000000000}"#
+        );
+        let back: Entry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sq, None);
+    }
+
+    #[test]
+    fn test_sq_cached_on_add() {
+        let data = Data::load(None);
+        data.add_history("https://duckduckgo.com/?q=rust", "DuckDuckGo");
+        data.add_history("https://example.com/", "Example");
+        {
+            let h = data.history.lock().unwrap();
+            assert_eq!(h[0].sq.as_deref(), Some("rust"));
+            assert_eq!(h[1].sq, None);
+        }
+        let s = data.suggest("rust", 6);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].query.as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn test_encode_percent_hex() {
+        let mut s = Settings::default();
+        s.custom_engines.push(Engine {
+            id: "x".into(),
+            name: "X".into(),
+            url: "https://x.test/?q=%s".into(),
+        });
+        s.search = "x".into();
+        let data = Data::load(None);
+        data.set_settings(s);
+        assert_eq!(data.search_url("a&b c"), "https://x.test/?q=a%26b+c");
+        assert_eq!(data.search_url("é"), "https://x.test/?q=%C3%A9");
+    }
+
+    #[test]
     fn bench_and_fingerprint() {
         use sha2::{Sha256, Digest};
         use std::time::Instant;
@@ -490,29 +572,38 @@ pub mod tests {
                         url: format!("https://duckduckgo.com/?q=query+term+{}", i % 50),
                         title: format!("Search results for query term {}", i % 50),
                         time: 1700000000000 + i as u64 * 1000,
+                        sq: None,
                     },
                     1 => Entry {
                         url: format!("https://www.google.com/search?q=rust+language+topic+{}", i % 30),
                         title: format!("Google Search - rust topic {}", i % 30),
                         time: 1700000000000 + i as u64 * 1000,
+                        sq: None,
                     },
                     2 => Entry {
                         url: format!("https://crates.io/crates/package-{}", i % 200),
                         title: format!("package-{} - crates.io: Rust Package Registry", i % 200),
                         time: 1700000000000 + i as u64 * 1000,
+                        sq: None,
                     },
                     3 => Entry {
                         url: format!("https://github.com/developer/repo-{}", i % 100),
                         title: format!("developer/repo-{} on GitHub", i % 100),
                         time: 1700000000000 + i as u64 * 1000,
+                        sq: None,
                     },
                     _ => Entry {
                         url: format!("https://docs.rs/library-{}/0.1.0/library/index.html", i % 80),
                         title: format!("library-{} - Rust docs", i % 80),
                         time: 1700000000000 + i as u64 * 1000,
+                        sq: None,
                     },
                 };
                 h.push(entry);
+            }
+            // Same cached query the real load/add paths compute (setup only, not timed).
+            for e in h.iter_mut() {
+                e.sq = search_query(&e.url);
             }
         }
 
