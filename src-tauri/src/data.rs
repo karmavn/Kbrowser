@@ -63,6 +63,26 @@ pub struct Entry {
     sq: Option<String>,
 }
 
+/// Minimal serializable projection of `Entry` for background disk persistence,
+/// avoiding cloning `sq` under the history mutex.
+#[derive(Serialize)]
+struct DiskEntry {
+    url: String,
+    title: String,
+    time: u64,
+}
+
+fn snapshot_disk(entries: &[Entry]) -> Vec<DiskEntry> {
+    entries
+        .iter()
+        .map(|e| DiskEntry {
+            url: e.url.clone(),
+            title: e.title.clone(),
+            time: e.time,
+        })
+        .collect()
+}
+
 pub struct Data {
     dir: Option<PathBuf>,
     settings: Mutex<Settings>,
@@ -145,6 +165,21 @@ pub(crate) fn now() -> u64 {
 
 impl Data {
     pub fn load(dir: Option<PathBuf>) -> Self {
+        // Clean up any stray *.tmp files left in AppData after an abrupt crash.
+        if let Some(d) = &dir {
+            for entry in fs::read_dir(d).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if p.is_file()
+                    && let Some(name) = p.file_name().and_then(|n| n.to_str())
+                    && name.ends_with(".tmp")
+                    && (name.starts_with("history.json.")
+                        || name.starts_with("settings.json.")
+                        || name.starts_with("session."))
+                {
+                    let _ = fs::remove_file(&p);
+                }
+            }
+        }
         let read = |name: &str| {
             dir.as_ref()
                 .and_then(|d| fs::read_to_string(d.join(name)).ok())
@@ -261,10 +296,11 @@ impl Data {
         let dup =
             matches!(h.last(), Some(l) if l.url == url && t.saturating_sub(l.time) < DEDUPE_MS);
         if dup {
-            if !title.is_empty() {
-                if let Some(l) = h.last_mut() {
-                    l.title = title.to_string();
-                }
+            if title.is_empty() || h.last().is_some_and(|l| l.title == title) {
+                return false;
+            }
+            if let Some(l) = h.last_mut() {
+                l.title = title.to_string();
             }
         } else {
             h.push(Entry {
@@ -278,7 +314,7 @@ impl Data {
         }
         // Serialize outside the history lock so suggest()/history() are not blocked
         // by the JSON encoding of up to 5,000 entries on every page visit.
-        let snapshot = h.clone();
+        let snapshot = snapshot_disk(&h);
         drop(h);
         self.save("history.json", &snapshot);
         true
@@ -300,7 +336,7 @@ impl Data {
             return h.iter().rev().take(1000).map(out).collect();
         }
         // std's to_lowercase has a tight ASCII fast path; measured faster than
-        // buffer-reuse variants in debug (see OPTIMIZE_REPORT.md).
+        // multi-field caches and SoA index scans in debug.
         h.iter()
             .rev()
             .filter(|e| e.title.to_lowercase().contains(&q) || e.url.to_lowercase().contains(&q))
@@ -315,12 +351,11 @@ impl Data {
         if q.is_empty() {
             return vec![];
         }
-        // Separate sets for URLs and search terms: no `format!("q:...")` key allocation,
-        // and a query can never collide with a URL.
-        let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Lock before borrowing &e.url into seen_urls so drop order matches borrow lifetime.
+        let history = self.history.lock().unwrap();
+        let mut seen_urls: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut seen_queries: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out = vec![];
-        let history = self.history.lock().unwrap();
 
         for e in history.iter().rev() {
             // e.sq was parsed once when the entry was created/loaded: no Url::parse here.
@@ -341,7 +376,7 @@ impl Data {
                     });
                 }
                 None => {
-                    if seen_urls.contains(&e.url) {
+                    if seen_urls.contains(e.url.as_str()) {
                         continue;
                     }
                     let title_lower = e.title.to_lowercase();
@@ -352,7 +387,7 @@ impl Data {
                     if !matches {
                         continue;
                     }
-                    seen_urls.insert(e.url.clone());
+                    seen_urls.insert(e.url.as_str());
                     out.push(Suggestion {
                         url: e.url.clone(),
                         title: e.title.clone(),
@@ -370,7 +405,7 @@ impl Data {
     pub fn remove(&self, time: u64, url: &str) {
         let mut h = self.history.lock().unwrap();
         h.retain(|e| !(e.time == time && e.url == url));
-        let snapshot = h.clone();
+        let snapshot = snapshot_disk(&h);
         drop(h);
         self.save("history.json", &snapshot);
     }
@@ -390,7 +425,7 @@ impl Data {
             let cutoff = now().saturating_sub(span);
             h.retain(|e| e.time < cutoff);
         }
-        let snapshot = h.clone();
+        let snapshot = snapshot_disk(&h);
         drop(h);
         self.save("history.json", &snapshot);
     }
@@ -414,10 +449,12 @@ pub mod tests {
     #[test]
     fn test_settings_validation() {
         let data = Data::load(None);
-        let mut s = Settings::default();
-        s.theme = "invalid_theme".into();
-        s.home = "   ".into();
-        s.search = "nonexistent".into();
+        let mut s = Settings {
+            theme: "invalid_theme".into(),
+            home: "   ".into(),
+            search: "nonexistent".into(),
+            ..Default::default()
+        };
         s.custom_engines.push(Engine {
             id: "".into(),
             name: "bad".into(),
@@ -443,19 +480,23 @@ pub mod tests {
         let u1 = data.search_url("hello world");
         assert_eq!(u1, "https://duckduckgo.com/?q=hello+world");
 
-        let mut s = Settings::default();
-        s.search = "google".into();
+        let s = Settings {
+            search: "google".into(),
+            ..Default::default()
+        };
         data.set_settings(s);
         let u2 = data.search_url("rust async");
         assert_eq!(u2, "https://www.google.com/search?q=rust+async");
 
-        let mut s = Settings::default();
-        s.custom_engines.push(Engine {
-            id: "yt".into(),
-            name: "YouTube".into(),
-            url: "https://www.youtube.com/results?search_query=%s".into(),
-        });
-        s.search = "yt".into();
+        let s = Settings {
+            search: "yt".into(),
+            custom_engines: vec![Engine {
+                id: "yt".into(),
+                name: "YouTube".into(),
+                url: "https://www.youtube.com/results?search_query=%s".into(),
+            }],
+            ..Default::default()
+        };
         data.set_settings(s);
         let u3 = data.search_url("tauri v2");
         assert_eq!(u3, "https://www.youtube.com/results?search_query=tauri+v2");
@@ -527,6 +568,55 @@ pub mod tests {
     }
 
     #[test]
+    fn test_dup_noop_and_title_update() {
+        let data = Data::load(None);
+        assert!(data.add_history("https://example.com/docs", "Initial"));
+        // Empty title or exact same title within dedupe window changes nothing and skips save/emit.
+        assert!(!data.add_history("https://example.com/docs", ""));
+        assert_eq!(data.history("")[0].title, "Initial");
+        assert!(!data.add_history("https://example.com/docs", "Initial"));
+        // New title within dedupe window updates title and stays searchable.
+        assert!(data.add_history("https://example.com/docs", "Updated Guide"));
+        let list = data.history("UPDATED");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, "Updated Guide");
+        let sugg = data.suggest("guide", 5);
+        assert_eq!(sugg.len(), 1);
+        assert_eq!(sugg[0].title, "Updated Guide");
+    }
+
+    #[test]
+    fn test_load_cleans_stray_tmp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "kbrowser_tmp_cleanup_test_{}_{}",
+            std::process::id(),
+            now()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let stray = [
+            "history.json.123.0.tmp",
+            "settings.json.123.1.tmp",
+            "session.123.2.tmp",
+        ];
+        let keep = ["history.json", "settings.json", "unrelated.tmp"];
+        for f in stray.iter().chain(keep.iter()) {
+            fs::write(dir.join(f), b"[]").unwrap();
+        }
+
+        let _ = Data::load(Some(dir.clone()));
+
+        for f in stray {
+            assert!(!dir.join(f).exists(), "stray tmp should be removed: {f}");
+        }
+        for f in keep {
+            assert!(dir.join(f).exists(), "non-matching file should remain: {f}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_sq_cached_on_add() {
         let data = Data::load(None);
         data.add_history("https://duckduckgo.com/?q=rust", "DuckDuckGo");
@@ -543,13 +633,15 @@ pub mod tests {
 
     #[test]
     fn test_encode_percent_hex() {
-        let mut s = Settings::default();
-        s.custom_engines.push(Engine {
-            id: "x".into(),
-            name: "X".into(),
-            url: "https://x.test/?q=%s".into(),
-        });
-        s.search = "x".into();
+        let s = Settings {
+            search: "x".into(),
+            custom_engines: vec![Engine {
+                id: "x".into(),
+                name: "X".into(),
+                url: "https://x.test/?q=%s".into(),
+            }],
+            ..Default::default()
+        };
         let data = Data::load(None);
         data.set_settings(s);
         assert_eq!(data.search_url("a&b c"), "https://x.test/?q=a%26b+c");
@@ -601,7 +693,6 @@ pub mod tests {
                 };
                 h.push(entry);
             }
-            // Same cached query the real load/add paths compute (setup only, not timed).
             for e in h.iter_mut() {
                 e.sq = search_query(&e.url);
             }

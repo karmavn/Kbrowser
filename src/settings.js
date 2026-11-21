@@ -1,6 +1,5 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
-const { getVersion} = window.__TAURI__.app;
 
 const $ = (s) => document.querySelector(s);
 const navItems = [...document.querySelectorAll(".navitem")];
@@ -41,7 +40,7 @@ function renderEngines() {
   }
 
   const root = $("#elist");
-  root.replaceChildren();
+  const frag = document.createDocumentFragment();
   for (const e of engines) {
     const card = document.createElement("div");
     card.className = "card";
@@ -54,28 +53,37 @@ function renderEngines() {
     url.textContent = e.url;
     label.append(name, url);
     const rm = document.createElement("button");
-    rm.className = "subtle";
+    rm.className = "subtle danger-hover";
     rm.textContent = "Remove";
     rm.onclick = () => {
       const custom_engines = settings.custom_engines.filter((x) => x.id !== e.id);
       save({ custom_engines, search: settings.search === e.id ? "duckduckgo" : settings.search });
     };
     card.append(label, rm);
-    root.append(card);
+    frag.append(card);
   }
+  root.replaceChildren(frag);
 }
 
-$("#eadd").onclick = () => {
+$("#eform").onsubmit = (ev) => {
+  ev.preventDefault();
   const name = $("#ename").value.trim();
   const url = $("#eurl").value.trim();
   const msg = $("#emsg");
-  if (!name) return void (msg.textContent = "Give the search engine a name.");
+  if (!name) {
+    msg.className = "empty msg-error";
+    msg.textContent = "Give the search engine a name.";
+    return;
+  }
   let ok = false;
   try { ok = /^https?:$/.test(new URL(url.replaceAll("%s", "test")).protocol); } catch {}
   if (!ok || !url.includes("%s")) {
-    return void (msg.textContent = "Enter an http(s) address that contains %s where the search terms go.");
+    msg.className = "empty msg-error";
+    msg.textContent = "Enter an http(s) address that contains %s where the search terms go.";
+    return;
   }
   const id = "c" + Date.now().toString(36);
+  msg.className = "empty msg-ok";
   msg.textContent = `Added ${name}.`;
   $("#ename").value = "";
   $("#eurl").value = "";
@@ -99,15 +107,14 @@ async function save(patch) {
   syncControls();
   try { await invoke("set_settings", { settings }); } catch (e) { console.error(e); }
 
-  
-//deleting the session the moment of deactivation to avoid unnecessary data storeage
-  if (!settings.save_session){
-      try {
-        await invoke("delete_session");
-      } catch (err) {
-        console.error("Failed to delete session file:", err);
-      }
+  // Delete session immediately when Save session is turned off to avoid unnecessary storage.
+  if (!settings.save_session) {
+    try {
+      await invoke("delete_session");
+    } catch (err) {
+      console.error("Failed to delete session file:", err);
     }
+  }
 }
 
 $("#search").onchange = (e) => save({ search: e.target.value });
@@ -115,8 +122,8 @@ $("#theme").onchange = (e) => save({ theme: e.target.value });
 $("#home").onchange = (e) => save({ home: e.target.value });
 $("#home").onkeydown = (e) => { if (e.key === "Enter") e.target.blur(); };
 $("#savehist").onclick = () => save({ save_history: !settings.save_history });
-$("#savesession").onclick = () => save({save_session: !settings.save_session});
-$("#showrec").onclick = () => save({show_suggestions: !settings.show_suggestions});
+$("#savesession").onclick = () => save({ save_session: !settings.save_session });
+$("#showrec").onclick = () => save({ show_suggestions: !settings.show_suggestions });
 
 // ---------- Navigation ----------
 
@@ -140,7 +147,10 @@ const dayFormatter = new Intl.DateTimeFormat([], { weekday: "long", month: "long
 const RM_SVG_NODE = (() => {
   const d = document.createElement("div");
   d.innerHTML = '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>';
-  return d.firstElementChild;
+  const svg = d.firstElementChild;
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  return svg;
 })();
 
 // todayStart is passed in so a 1,000-row render computes "today" once, and each
@@ -168,64 +178,92 @@ function describe(e) {
   }
 }
 
+const $hlist = $("#hlist");
+const $hempty = $("#hempty");
+
+// Single delegated click handler for up to 1,000 history rows (avoids 2,000 per-row closures).
+$hlist.onclick = (ev) => {
+  const rmBtn = ev.target.closest("button.icon");
+  if (rmBtn) {
+    const row = rmBtn.closest(".hrow");
+    if (!row) return;
+    const time = Number(row.dataset.time);
+    const url = row.dataset.url;
+    // Remove orphaned day heading when its last row is removed.
+    const prev = row.previousElementSibling;
+    const next = row.nextElementSibling;
+    if (prev?.classList.contains("day") && (!next || next.classList.contains("day"))) {
+      prev.remove();
+    }
+    row.remove();
+    invoke("history_remove", { time, url });
+    if (!$hlist.querySelector(".hrow")) {
+      $hlist.replaceChildren();
+      $hempty.hidden = false;
+      $hempty.textContent = $("#hq").value.trim() ? "No matching history." : "No browsing history yet.";
+    }
+    return;
+  }
+  const linkBtn = ev.target.closest("button.link");
+  if (linkBtn) {
+    const row = linkBtn.closest(".hrow");
+    if (row?.dataset.url) invoke("open_page", { url: row.dataset.url });
+  }
+};
+
 let historySeq = 0;
 async function loadHistory() {
   const seq = ++historySeq;
   const q = $("#hq").value;
-  const items = await invoke("history_list", { query: q });
-  if (seq !== historySeq) return; // a newer query already answered: drop stale list
-  const root = $("#hlist");
-  const empty = $("#hempty");
-  empty.hidden = items.length > 0;
-  empty.textContent = q.trim() ? "No matching history." : "No browsing history yet.";
+  $hlist.setAttribute("aria-busy", "true");
+  try {
+    const items = await invoke("history_list", { query: q });
+    if (seq !== historySeq) return; // a newer query already answered: drop stale list
+    $hempty.hidden = items.length > 0;
+    $hempty.textContent = q.trim() ? "No matching history." : "No browsing history yet.";
 
-  const frag = document.createDocumentFragment();
-  const todayStart = new Date().setHours(0, 0, 0, 0);
-  let lastDay = "";
-  for (const e of items) {
-    const day = dayLabel(e.time, todayStart);
-    if (day !== lastDay) {
-      lastDay = day;
-      const h = document.createElement("h4");
-      h.className = "day";
-      h.textContent = day;
-      frag.append(h);
-    }
-    const d = describe(e);
-    const row = document.createElement("div");
-    row.className = "hrow";
-
-    const main = document.createElement("div");
-    main.className = "hmain";
-    const open = document.createElement("button");
-    open.className = "link";
-    open.textContent = d.title;
-    open.title = e.url;
-    open.onclick = () => invoke("open_page", { url: e.url });
-    const sub = document.createElement("span");
-    sub.className = "sub";
-    sub.textContent = `${d.host} · ${timeFormatter.format(e.time)}`;
-    main.append(open, sub);
-
-    const rm = document.createElement("button");
-    rm.className = "icon";
-    rm.title = "Remove from history";
-    rm.setAttribute("aria-label", "Remove from history");
-    rm.appendChild(RM_SVG_NODE.cloneNode(true));
-    rm.onclick = () => {
-      // Optimistic UI removal: remove row immediately without waiting for disk flush
-      row.remove();
-      invoke("history_remove", { time: e.time, url: e.url });
-      if (!root.querySelector(".hrow")) {
-        root.replaceChildren();
-        empty.hidden = false;
+    const frag = document.createDocumentFragment();
+    const todayStart = new Date().setHours(0, 0, 0, 0);
+    let lastDay = "";
+    for (const e of items) {
+      const day = dayLabel(e.time, todayStart);
+      if (day !== lastDay) {
+        lastDay = day;
+        const h = document.createElement("h4");
+        h.className = "day";
+        h.textContent = day;
+        frag.append(h);
       }
-    };
+      const d = describe(e);
+      const row = document.createElement("div");
+      row.className = "hrow";
+      row.dataset.time = String(e.time);
+      row.dataset.url = e.url;
 
-    row.append(main, rm);
-    frag.append(row);
+      const main = document.createElement("div");
+      main.className = "hmain";
+      const open = document.createElement("button");
+      open.className = "link";
+      open.textContent = d.title;
+      open.title = e.url;
+      const sub = document.createElement("span");
+      sub.className = "sub";
+      sub.textContent = `${d.host} · ${timeFormatter.format(e.time)}`;
+      main.append(open, sub);
+
+      const rm = document.createElement("button");
+      rm.className = "icon";
+      rm.title = "Remove from history";
+      rm.setAttribute("aria-label", "Remove from history");
+      rm.appendChild(RM_SVG_NODE.cloneNode(true));
+
+      row.append(main, rm);
+      frag.append(row);
+    }
+    $hlist.replaceChildren(frag);
+  } finally {
+    if (seq === historySeq) $hlist.removeAttribute("aria-busy");
   }
-  root.replaceChildren(frag);
 }
 
 let timer;
@@ -241,38 +279,53 @@ $("#dlg-ok").onclick = async () => {
 // ---------- Extensions ----------
 
 async function loadExts() {
-  const exts = await invoke("list_extensions");
   const root = $("#xlist");
-  $("#xmsg").textContent = exts.length ? "" : "No extensions installed.";
-  const frag = document.createDocumentFragment();
-  for (const e of exts) {
-    const card = document.createElement("div");
-    card.className = "card";
+  root.setAttribute("aria-busy", "true");
+  try {
+    const exts = await invoke("list_extensions");
+    $("#xmsg").className = "empty";
+    $("#xmsg").textContent = exts.length ? "" : "No extensions installed.";
+    const frag = document.createDocumentFragment();
+    for (const e of exts) {
+      const card = document.createElement("div");
+      card.className = "card";
 
-    const label = document.createElement("div");
-    label.className = "label";
-    const name = document.createElement("strong");
-    name.textContent = e.name;
-    const meta = document.createElement("span");
-    meta.textContent = `${e.version} · ${e.active ? "On" : "Starts after restart"}`;
-    label.append(name, meta);
+      const label = document.createElement("div");
+      label.className = "label";
+      const name = document.createElement("strong");
+      name.textContent = e.name;
+      const meta = document.createElement("div");
+      meta.className = "ext-meta";
+      const ver = document.createElement("span");
+      ver.textContent = `v${e.version}`;
+      const badge = document.createElement("span");
+      badge.className = e.active ? "badge ok" : "badge pending";
+      badge.textContent = e.active ? "On" : "Starts after restart";
+      meta.append(ver, badge);
+      label.append(name, meta);
 
-    const btn = document.createElement("button");
-    btn.className = "subtle";
-    btn.textContent = "Settings";
-    btn.disabled = !e.options || !e.active;
-    btn.title = !e.options
-      ? "This extension has no settings page"
-      : !e.active ? "Restart the browser to start this extension" : "";
-    btn.onclick = async () => {
-      try { await invoke("open_extension_options", { id: e.id }); }
-      catch (err) { $("#xmsg").textContent = String(err); }
-    };
+      const btn = document.createElement("button");
+      btn.className = "subtle";
+      btn.textContent = "Settings";
+      btn.disabled = !e.options || !e.active;
+      btn.title = !e.options
+        ? "This extension has no settings page"
+        : !e.active ? "Restart the browser to start this extension" : "";
+      btn.onclick = async () => {
+        try { await invoke("open_extension_options", { id: e.id }); }
+        catch (err) {
+          $("#xmsg").className = "empty msg-error";
+          $("#xmsg").textContent = String(err);
+        }
+      };
 
-    card.append(label, btn);
-    frag.append(card);
+      card.append(label, btn);
+      frag.append(card);
+    }
+    root.replaceChildren(frag);
+  } finally {
+    root.removeAttribute("aria-busy");
   }
-  root.replaceChildren(frag);
 }
 
 $("#store").onclick = () => invoke("open_page", { url: "https://chromewebstore.google.com/" });
@@ -310,8 +363,8 @@ listen("history-updated", () => {
     syncControls();
   }
   $("#wv").textContent = wvVersion;
-  const versionExists = $("#kbrowser-version");
-  if (versionExists && appVersion) {
-    versionExists.innerText = appVersion;
+  const versionEl = $("#kbrowser-version");
+  if (versionEl && appVersion) {
+    versionEl.textContent = appVersion;
   }
 })();

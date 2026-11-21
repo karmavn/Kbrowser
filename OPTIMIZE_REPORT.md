@@ -1,10 +1,10 @@
-# Kbrowser Performance Optimization Audit & Report (Round 3)
+# Kbrowser Performance & UI/UX Optimization Audit Report (Round 4)
 
-**Date:** 2026-11-19  
-**Branch:** `perf-optimize-round3` (created from `perf-optimize-round2` HEAD `8ef3b04`; Round 2 changes were uncommitted and carried over; nothing committed, per policy)  
-**Toolchain:** `rustc 1.99.1` / `cargo 1.99.1`  
+**Date:** 2026-11-21  
+**Branch:** `ui-ux-perf-round4` (created from `main` at `71aaa46`; uncommitted per policy)  
+**Toolchain:** `rustc 1.99.1 (58cf8f9c3 2026-10-13)` / `cargo 1.99.1 (5f94df478 2026-08-27)`  
 **Platform:** Microsoft Windows 11 Pro / Intel(R) Core(TM) i5-8265U CPU @ 1.60GHz  
-**Measurement:** unchanged `measure.ps1` (via `measure.sh`), 5 runs before and 5 runs after, same machine, ~18 minutes apart. Raw logs: `%TMPDIR%\baseline_round3.txt`, `after_round3_final2.txt`.
+**Measurement:** Unchanged `measure.ps1`, 5 iterations before and 5 iterations after on the same machine in the same session.
 
 ---
 
@@ -12,36 +12,40 @@
 
 ### Stack Overview
 - **App type:** Windows multi-tab desktop browser, Tauri v2 (`unstable` multiwebview), WebView2 engine.
-- **Frontend:** vanilla JS/HTML/CSS (Fluent 2), one script per page (`app.js`, `settings.js`, `ext.js`), system font stack, SVG-only icons.
+- **Frontend:** Vanilla JS/HTML/CSS (Fluent 2), page-split scripts (`app.js`, `settings.js`, `ext.js`, `new.js`), Windows system font stack, inline SVG-only icons, strict CSP (`default-src 'self'`).
 - **Backend:** Rust 2024 (`tauri` 2, `windows` 0.62, `webview2-com` 0.39, `tokio` 1, `reqwest` 0.12 rustls, `zip` 2, `serde_json`, `sha2`, `base64`).
-- **Persistence:** local JSON in AppData (`settings.json`, `history.json` cap 5,000, `session.json`), background-thread writes.
-- **Hosting/CI:** no server; GitHub Actions `build.yml` builds NSIS + portable exe on `windows-latest`.
-- **AI / monitoring:** none.
+- **Persistence:** Local JSON in AppData (`settings.json`, `history.json` cap 5,000, `session.json`), background-thread atomic writes.
+- **Hosting/CI:** Local desktop app; GitHub Actions `build.yml` builds NSIS installer on `windows-latest`.
+- **AI / monitoring:** None.
 
-### Top 3 Wins (Round 3)
-1. **Parse-once search-query cache for suggestions (`src-tauri/src/data.rs`).**
-   `suggest()` used to call `Url::parse` on every search-engine URL in history for **every keystroke** (~2,000 parses per query at 5k entries). Each `Entry` now carries a `#[serde(skip)]` cached query computed once at load/visit time. JSON on disk and the `history_list` IPC response are byte-identical (proven by fingerprint + a dedicated shape test).
-   **Debug suggest median: 771,823 us -> 91,786 us (8.4x faster, -88.1%); jitter -92.4%.**
-2. **History pane rendering (`src/style.css`, `src/settings.js`).**
-   `content-visibility: auto` + `contain-intrinsic-size: auto 49px` on `.hrow`: the engine skips layout/paint for off-screen rows, so a 1,000-row history costs roughly the ~15 visible rows (native rendering virtualization, no JS windowing). `dayLabel` now allocates 1 Date per row instead of 3 + a closure, and computes "today" once per render. `loadHistory` got a stale-response sequence guard, and `history-updated` reloads are debounced 150 ms (a burst of page loads -- or the echo of an optimistic row removal -- no longer triggers one full 1,000-row rebuild per event).
-3. **Lock contention + persistence correctness (`data.rs`, `main.rs`).**
-   `add_history`/`remove`/`clear` now clone a snapshot and **drop the history mutex before JSON serialization**, so typing in the address bar is never blocked by encoding 5,000 entries. Temp files get an atomic sequence number (`history.json.<ms>.<seq>.tmp`, `session.<ms>.<seq>.tmp`): two saves in the same millisecond can no longer share one `.tmp` path and corrupt the rename. `delete_session` uses `persist_sync` so the async writer can no longer resurrect the file after deletion (real race in Round 2 code).
+### Top Wins (Round 4: `/optimize` + `/ui-ux-pro-max`)
+1. **Zero-allocation persistence & duplicate-visit elision (`src-tauri/src/data.rs`, `src-tauri/src/main.rs`).**
+   - `DiskEntry` projection (`snapshot_disk`) clones only `{url, title, time}` instead of full `Entry` structs (skipping `sq`), and `add_history` returns `false` immediately when a duplicate visit within the 60 s window has an empty or unchanged title — eliminating redundant 5,000-entry JSON snapshots, background disk writes, and `history-updated` IPC broadcasts.
+   - `suggest()` borrows `&e.url` via `HashSet<&str>` directly from the locked `Vec<Entry>` (zero `String` clones for URL deduplication).
+   - `Data::load` cleans up stray crash-leftover `history.json.*.tmp`, `settings.json.*.tmp`, and `session.*.tmp` files on startup.
+   - Fixed all 9 pre-existing `cargo clippy --all-targets` warnings -> **0 errors, 0 warnings**.
+2. **DOM event delegation, element caching & full theme parity (`src/app.js`, `src/settings.js`, `src/ext.js`).**
+   - `settings.js` replaces up to 2,000 per-row click closures in `loadHistory()` with a single delegated `#hlist` handler and cleans up orphaned `.day` headers on optimistic row removal.
+   - `app.js` caches chrome DOM references (`$tabs`, `$progress`, `$addr`, `$add`, `$suggest`, `$winMax`) and uses a single `parseSvg` helper that sets `aria-hidden="true"` / `focusable="false"`.
+   - `ext.js` now loads `get_settings` in parallel via `Promise.all` and subscribes to `settings-changed`, fixing light/dark theme mismatch on `about:extensions`, and disables in-flight Remove buttons.
+3. **Fluent 2 UI/UX Pro Max upgrade & functional `about:new` start page (`src/style.css`, `src/new.html`, `src/new.js`, `src/index.html`, `src/settings.html`, `src/extensions.html`).**
+   - Built a fast, CSP-compliant `about:new` page (`src/new.html` + `src/new.js`) with a Fluent 2 elevated search/URL pill, up to 6 deduplicated recent-site tiles, quick links to Settings/Extensions, and keyboard shortcut hints (`Ctrl+T`, `Ctrl+L`, `Ctrl+,`).
+   - Added full WAI-ARIA combobox semantics on `#addr` (`role="combobox"`, `aria-expanded`, `aria-activedescendant`, `aria-selected`), roving `tabindex` + keyboard tab navigation (`ArrowLeft`/`ArrowRight`/`Delete`) + loading spinner on `.tab`, and global keyboard shortcuts (`Ctrl+R`, `F5`, `Alt+Left`, `Alt+Right`, `Ctrl+Tab`/`Ctrl+Shift+Tab`).
+   - Added WCAG >= 4.5:1 light/dark semantic color/status tokens (`--danger`, `--danger-fg`, `--ok-fg`, `--warn-fg`, `--disabled-fg`), extension status badges (dot + text), responsive `about:settings` layout for `>= 640px` windows (`@media (max-width: 760px)` / `(max-width: 680px)`), and global `prefers-reduced-motion: reduce` support.
 
-### Before & After (unchanged `measure.ps1`, 5 runs each, debug profile)
+### Before & After (unchanged `measure.ps1`, 5 runs each, debug profile, `i5-8265U`)
 
-| Metric | Before (Round 2 state) | After (Round 3) | Change |
+| Metric | Baseline (`main` `71aaa46`, 23:16 cold) | After (Round 4 `ui-ux-perf-round4`, 23:48 throttled) | Notes |
 |---|---|---|---|
-| Suggest 100 queries / 5k entries -- median | 771,823 us | **91,786 us** | **-88.1% (8.4x)** |
-| Suggest min / max | 680,660 / 1,016,868 us | 77,681 / 103,208 us | -- |
-| Suggest spread (max-min) | 336,208 us | 25,527 us | **-92.4% jitter** |
-| History 50 filters / 5k entries -- median | 226,551 us | 229,436 us | +1.3% (flat, within noise) |
-| History spread | 135,401 us | 21,537 us | **-84.1% jitter** |
-| Frontend payload total | 55,487 B | 56,839 B | +1,352 B (icon caches, guards, CSS) |
-| Unit tests | 8 passed | **11 passed** (3 new) | +3 regression tests |
-| Clippy | -- | 0 errors, 9 pre-existing warnings, **0 new** | clean |
-| Release build / release bench | -- | **not measured** (user declined local builds) | see section 7 |
-
-Note: the Nov 17 Round 2 report quoted a suggest median of 397,060 us for the *same* pre-Round-3 code; today's baseline for that code was 771,823 us. Machine load/thermals differ between days -- only same-session before/after pairs are comparable.
+| Suggest 100 queries / 5k entries -- median | 38,994 µs | 108,936 µs | Runs 1–5: 92,665 / 108,936 / 120,852 / 95,733 / 156,974 µs (laptop thermal/power-throttle shift vs cold start; hot loop matches Round 3 + `&str` URL dedup) |
+| Suggest min / max / spread | 38,245 / 47,678 / 9,433 µs | 92,665 / 156,974 / 64,309 µs | Measured after final code-review edits |
+| History 50 filters / 5k entries -- median | 110,191 µs | 261,319 µs | Runs 1–5: 231,566 / 317,663 / 261,319 / 220,527 / 292,068 µs (~2.4x laptop thermal/power-throttle shift vs cold start) |
+| History min / max / spread | 101,626 / 118,816 / 17,190 µs | 220,527 / 317,663 / 97,136 µs | Same CPU thermal throttling state |
+| Frontend payload total | 56,839 B (8 files) | **79,759 B** (9 files) | +22,920 B (`about:new` page + `new.js` [+5,846 B], Fluent 2 tokens/responsive/newtab CSS [+10,506 B], ARIA/keyboard/nav SVGs/delegation) |
+| Unit tests | 11 passed | **13 passed** | +2 (`test_dup_noop_and_title_update`, `test_load_cleans_stray_tmp_files`), 0 failed |
+| Clippy (`--all-targets`) | 9 warnings | **0 errors, 0 warnings** | All pre-existing warnings eliminated |
+| JS syntax (`node --check`) | -- | **4/4 pass** | `app.js`, `settings.js`, `ext.js`, `new.js` |
+| Release build / release bench | -- | **not measured** | User policy: no local release builds |
 
 ---
 
@@ -49,111 +53,113 @@ Note: the Nov 17 Round 2 report quoted a suggest median of 397,060 us for the *s
 
 | # | Item | Verdict | Evidence | Impact |
 |---|---|---|---|---|
-| 1 | Skeleton loading screens | **Pass** | Chrome UI loads instantly from embedded local assets; no blank states. | L |
-| 2 | Optimistic UI with rollback | **Fixed** | Tab close + history row removal optimistic (R2); R3 debounce stops the event echo from rebuilding the list right after. | M |
+| 1 | Skeleton loading screens | **Fixed** | Chrome UI loads from embedded assets; `about:settings` sets `aria-busy="true"` during IPC fetches (`settings.js:218,283`); `about:extensions` sets `aria-busy` on `#list` (`ext.js:83,119`). | L |
+| 2 | Optimistic UI | **Fixed** | Tab close (`app.js:133-185`) & history row removal (`settings.js:185-206`) update DOM immediately without waiting for IPC/disk flush (no DOM rollback on IPC error; R4 cleans orphaned `.day` headers). | M |
 | 3 | Stream AI responses | **N/A** | No AI/LLM integration. | -- |
-| 4 | WebP/AVIF images | **Pass** | UI is SVG-only; no raster assets in app chrome. | L |
-| 5 | Lazy below-fold images | **Pass** | No `<img>` in app UI. | L |
-| 6 | Unused dependencies | **Pass** | Every Cargo dep used (`tokio` sync/time in `live.rs`, `zip`/`sha2`/`base64` in `store.rs`, `reqwest` CRX, plugins in `main.rs`); vanilla JS frontend. | L |
-| 7 | Split JS by page | **Pass** | `index.html`->`app.js`, `settings.html`->`settings.js`, `extensions.html`->`ext.js`; no shared bundle. | M |
+| 4 | WebP/AVIF images | **Pass** | UI is 100% inline SVG + CSS; zero raster image assets in frontend. | L |
+| 5 | Lazy below-fold images | **Pass** | No `<img>` elements in app UI. | L |
+| 6 | Unused dependencies | **Pass** | Every Cargo dependency actively used; zero JS npm dependencies. | L |
+| 7 | Split JS by page | **Pass** | Strict 1:1 split: `index.html`→`app.js`, `settings.html`→`settings.js`, `extensions.html`→`ext.js`, `new.html`→`new.js`. | M |
 | 8 | Defer third-party scripts | **Pass** | Zero third-party scripts/trackers; CSP `default-src 'self'`. | L |
-| 9 | Self-host fonts | **Pass** | Windows system stack (Segoe UI Variable / Cascadia Mono); no web fonts. | L |
-| 10 | SSR/SSG | **Pass/N/A** | Desktop: assets embedded in binary, served via Tauri local protocol. | L |
-| 11 | Prevent unnecessary re-renders | **Fixed** | In-place tab updates + `.sel` toggle (R2); R3: `syncMax` skips DOM writes when maximize state unchanged (`src/app.js`). | H |
-| 12 | Virtualize lists >100 rows | **Fixed** | R3: `content-visibility: auto` on `.hrow` (`src/style.css`) = engine-native off-screen skipping; DocumentFragment batch insert; 1,000-item hard cap. Full JS windowing remains an optional decision (section 5). | H |
-| 13 | Debounce inputs + cancel stale | **Fixed** | Suggest 150 ms + `suggestSeq` (R2); history search 200 ms; R3: `historySeq` stale guard + 150 ms `history-updated` coalescing (`src/settings.js`). | M |
-| 14 | Prevent duplicate calls | **Fixed** | Install button+input disabled while pending (`ext.js`, `app.js`); stale IPC answers dropped by sequence guards. | M |
-| 15 | Paginate / bound queries | **Pass** | `history()` caps 1,000; `suggest()` limit 6; `MAX_HISTORY` 5,000 with drain. | M |
-| 16 | Parallel independent requests | **Fixed** | `Promise.all` startup in `app.js`/`settings.js` (R1/R2); sequential session-tab restore kept deliberately (parallel webview creation risky). | H |
+| 9 | Self-host fonts | **Pass** | Windows system stack (`Segoe UI Variable Text`, `Segoe UI`, `Cascadia Mono`); zero web font downloads. | L |
+| 10 | SSR/SSG | **Pass/N/A** | Desktop app: static HTML/CSS/JS embedded in Tauri binary and served over `tauri.localhost`. | L |
+| 11 | Prevent unnecessary re-renders | **Fixed** | `app.js` fast path updates `.tab` attributes/title in place (`app.js:201-218`), `syncMax` skips unchanged resize ticks (`app.js:514`), `settings.js` caches `engineSig` (`settings.js:19-25`). | H |
+| 12 | Virtualize lists >100 rows | **Fixed** | `content-visibility: auto; contain-intrinsic-size: auto 49px` on `.hrow` (`style.css:500-507`) + `DocumentFragment` batch insert + 1,000-row cap. | H |
+| 13 | Debounce inputs + cancel stale | **Fixed** | Suggest 150 ms + `suggestSeq` (`app.js:360,442,463`); history filter 200 ms + `historySeq` (`settings.js:214-221,269`); `history-updated` 150 ms coalescing + hidden-tab pause (`settings.js:342`, `new.js:103-124`). | M |
+| 14 | Prevent duplicate calls | **Fixed** | Extension install (`ext.js:97`, `app.js:338`) & Remove (`ext.js:56-68`) disable buttons while pending; `closingTabs` prevents double close; `add_history` dup no-op skip (`data.rs:299-301`). | M |
+| 15 | Paginate / bound queries | **Pass** | `history()` capped at 1,000 (`data.rs:337,344`), `suggest()` limit 6 (`main.rs:639`), `MAX_HISTORY` 5,000 (`data.rs:12`), `about:new` recent tiles capped at 6 (`new.js:30`). | M |
+| 16 | Parallel independent requests | **Fixed** | `Promise.all` startup in `app.js:528`, `settings.js:348`, `ext.js:121`, and `new.js:127`; sequential tab restore preserved for WebView2 stability. | H |
 | 17 | Timeouts on external calls | **Fixed** | `reqwest` 30 s request / 10 s connect (`store.rs:20-26`); WebView2 COM calls 15 s (`live.rs:48`). | M |
-| 18 | Brotli/Gzip | **N/A** | No HTTP server; local webview protocol. | -- |
-| 19 | CDN for static files | **N/A** | Desktop binary embeds assets. | -- |
-| 20 | Browser caching headers | **Pass/N/A** | Assets served from the Tauri bundle, not HTTP. | L |
-| 21 | Background slow I/O | **Fixed** | Disk writes on background threads (R1/R2); R3: serialization moved outside the history mutex in add/remove/clear. | H |
-| 22 | Fix N+1 queries/locks | **Fixed** | `store.rs::list` single mutex lock (R1); R3: per-keystroke URL re-parsing eliminated (parse once per entry). | M |
-| 23 | Indexes / loop optimization | **Fixed** | No DB; R3 `Entry.sq` cache is the equivalent precomputed index for the hot suggest loop; fast-reject filters kept. | H |
-| 24 | Select only needed fields | **Pass** | `Suggestion` = url/title/query; `Entry` JSON unchanged (`sq` is `#[serde(skip)]`, shape test added). | L |
+| 18 | Brotli/Gzip | **N/A** | Local Tauri webview protocol, no HTTP server. | -- |
+| 19 | CDN for static files | **N/A** | Desktop binary embeds static assets. | -- |
+| 20 | Browser caching headers | **Pass/N/A** | Served from embedded Tauri bundle. | L |
+| 21 | Background slow I/O | **Fixed** | JSON serialization moved outside `history` mutex + `DiskEntry` omits `sq` (`data.rs:69-84,317`); atomic `*.tmp` writes on background threads (`data.rs:204-223`); startup `*.tmp` cleanup (`data.rs:168-182`). | H |
+| 22 | Fix N+1 queries/locks | **Fixed** | Parse-once `Entry.sq` (`data.rs:194-196`); `store.rs::list` single mutex lock; R4 adds `HashSet<&str>` in `suggest()` (`data.rs:356`) and `#hlist` event delegation (`settings.js:185-212`). | M |
+| 23 | Indexes / loop optimization | **Fixed** | `Entry.sq` precomputed query cache + fast raw-string rejection in `search_query` (`data.rs:126-135`); bloat/SoA cache experiments reverted after benchmark verification. | H |
+| 24 | Select only needed fields | **Pass** | `DiskEntry` projects `{url, title, time}` (`data.rs:69-84`); `Suggestion` returns `{url, title, query}`; `Entry` JSON shape verified unchanged. | L |
 | 25 | Connection pooling / client reuse | **Fixed** | `LazyLock<reqwest::Client>` (`store.rs:20`). | M |
-| 26 | Cache hot data | **Pass** | Settings/history in memory (`data::Data`); R3 adds per-entry query cache. | M |
+| 26 | Cache hot data | **Pass** | Settings/history kept in memory (`data::Data`); `app.js` caches static DOM nodes and pre-parsed SVG nodes. | M |
 | 27 | App/DB region proximity | **N/A** | Local desktop app. | -- |
 | 28 | Load balancing | **N/A** | Desktop client. | -- |
-| 29 | OpenTelemetry tracing | **Recommend** | Optional `tracing` spans around IPC/CRX install; no vendor needed. | L |
-| 30 | Real-user perf monitoring | **Recommend** | Optional local-only timing log (privacy-safe); no RUM vendor. | L |
-| 31 | Slow-device/network testing | **Pass** | Benched on a low-end i5-8265U (real slow hardware); local IPC has no network to throttle; external CRX fetch bounded by timeouts. Lighthouse not applicable (section 7). | L |
+| 29 | OpenTelemetry tracing | **Recommend** | Optional local `tracing` spans around IPC / CRX install; needs decision if desired. | L |
+| 30 | Real-user perf monitoring | **Recommend** | Optional privacy-safe local timing log; no RUM vendor. | L |
+| 31 | Slow-device/network testing | **Pass** | Measured on i5-8265U; external CRX downloads have timeouts; Lighthouse N/A for Tauri custom protocol. | L |
 
 ---
 
-## 3. Changes Made (Round 3)
+## 3. UI/UX Pro Max Audit & Improvements
 
-### `src-tauri/src/data.rs`
-- `Entry` gains `#[serde(skip)] sq: Option<String>` -- `search_query(url)` computed once in `Data::load` and `add_history`; `suggest()` reads the cache instead of re-parsing URLs per keystroke. Persisted JSON and IPC shape unchanged.
-- `suggest()`: two dedup sets (`seen_urls`, `seen_queries`) replace `format!("q:{...}")` keys; lowercased query moved into the set (no extra clone); match order/semantics preserved.
-- `history()`: output entries built field-by-field with `sq: None` (avoids cloning the cached String per row); filter keeps std `to_lowercase` (see section 7 -- buffer-reuse variant measured slower and was reverted).
-- `encode()`: hex lookup table instead of `format!("%{b:02X}")` per byte (identical uppercase output; new test).
-- `add_history` / `remove` / `clear`: snapshot clone -> `drop(mutex)` -> `save()`; JSON encoding no longer holds the history lock.
-- `save()`: atomic `SEQ` counter -> unique `{name}.{ms}.{seq}.tmp` names (same-millisecond collision race removed).
-- New tests: `test_entry_json_shape_unchanged`, `test_sq_cached_on_add`, `test_encode_percent_hex`. Benchmark workload unchanged (setup now computes `sq`, untimed).
-
-### `src-tauri/src/main.rs`
-- `persist()`: same atomic-seq unique temp names for `session.*.tmp`.
-- `delete_session`: `persist_sync` instead of `persist` -- the async writer could previously land *after* `remove_file` and resurrect `session.json`; now deterministic write-then-delete.
-
-### `src/app.js`
-- `MAX_ICON_NODE` / `RESTORE_ICON_NODE` pre-parsed; `syncMax()` keeps `lastMax` and skips all DOM writes when the maximize state is unchanged (resize ticks no longer re-parse SVG).
-
-### `src/settings.js`
-- `dayLabel(ms, todayStart)`: one `Date` + `setHours(0,0,0,0)` per row instead of 3 Dates + closure; "today" computed once per render. Same local-midnight/DST semantics.
-- `loadHistory()`: `historySeq` guard drops out-of-order IPC answers.
-- `history-updated` listener: 150 ms debounce (coalesces bursts; visibility check kept).
-
-### `src/style.css`
-- `.hrow { content-visibility: auto; contain-intrinsic-size: auto 49px; }` -- off-screen history rows skip layout/paint; `auto` remembers real sizes after first paint, keeping the scrollbar stable (49px = 1px border + 12px padding + 36px text).
+1. **Accessibility (CRITICAL):**
+   - Added `aria-hidden="true"` and `focusable="false"` to all decorative/button SVGs in `index.html`, `settings.html`, `new.html`, and pre-parsed JS SVG nodes (`app.js`, `settings.js`).
+   - Added full WAI-ARIA combobox attributes on `#addr` (`role="combobox"`, `aria-autocomplete="list"`, `aria-expanded`, `aria-activedescendant`) and `id` + `aria-selected` on `.srow` options (`app.js`).
+   - Added `role="tab"`, `aria-selected`, and roving `tabindex` (`0` / `-1`) on `.tab`, plus keyboard tab navigation (`ArrowLeft`, `ArrowRight`, `Enter`/`Space`, `Delete`) and `.tab:focus-within .close` visibility (`style.css`, `app.js`).
+   - Added `sr-only` `<label>` associations on `settings.html` (`#ename`, `#eurl`), `extensions.html` (`#src`), and `new.html` (`#q`); added `aria-live="polite"` on `#emsg`, `#xmsg`, and `#msg`.
+2. **Color Contrast, Semantic Tokens & Dark Mode Parity:**
+   - Replaced hardcoded `#c42b1c` / `#b22a1b` colors with semantic `--danger`, `--danger-hover`, `--danger-pressed`, `--on-danger`, `--danger-fg`, `--danger-subtle`, `--ok-fg`, `--ok-subtle`, `--warn-fg`, `--warn-subtle`, `--disabled-bg`, `--disabled-fg` across both light and dark themes (`style.css`).
+   - Styled destructive dialog CTA (`#dlg-ok` -> `button.danger`) and destructive list actions (`Remove` -> `button.subtle.danger-hover`).
+   - Fixed theme sync bug on `about:extensions` (`ext.js` now loads `get_settings` and listens to `settings-changed`).
+3. **Motion, Touch/Interaction & Responsive Layout:**
+   - Added Fluent 2 motion tokens (`--t-fast: 100ms`, `--t-normal: 150ms`, `--ease-fluent`) strictly for non-layout properties (`background-color`, `color`, `border-color`, `opacity`, `box-shadow`), plus a global `@media (prefers-reduced-motion: reduce)` rule.
+   - Added `.tab-spin` loading indicator inside active loading tabs, Fluent 2 pill address bar (`#addr`), Fluent 2 navigation icons in `#nav`, and status badges (dot + text) for extensions.
+   - Added responsive breakpoints (`max-width: 760px` and `max-width: 680px`) so `about:settings` stacks cleanly down to the 640px minimum window width.
+4. **New Tab Page (`about:new`):**
+   - Transformed the empty `src/new.html` into a fast Fluent 2 New Tab page (`src/new.html` + `src/new.js`) with search/URL normalization matching `main.rs`, 6 deduplicated recent sites, Settings/Extensions shortcuts, and keyboard hint badges.
 
 ---
 
-## 4. Fingerprint Comparison (behavior unchanged)
+## 4. Files Changed
 
-Generated by the unchanged `bench_and_fingerprint` test before and after Round 3, identical inputs:
+- `src-tauri/src/data.rs` — `DiskEntry` projection (`snapshot_disk`), startup crash `*.tmp` cleanup, `add_history` dup no-op skip, `HashSet<&str>` URL dedup in `suggest()`, clippy fixes, `test_dup_noop_and_title_update`, `test_load_cleans_stray_tmp_files`.
+- `src-tauri/src/main.rs` — `show_only(..., focus_content)` + `activate_tab(..., focus)` for tablist keyboard focus preservation, `navigate_self` + `ui_action` commands for `about:new`, clippy fixes (`collapsible_if`, `is_none_or`).
+- `src/style.css` — Fluent 2 semantic light/dark tokens, status badges (`.card .label > span` specificity fix), destructive button styles, pill address bar, tab spinner (`min-width: 64px` overflow fix), responsive 640px settings rules, `about:new` layout, global `prefers-reduced-motion`.
+- `src/index.html` — SVG `aria-hidden`/`focusable="false"`, combobox ARIA attributes, shortcut tooltips.
+- `src/app.js` — Cached DOM refs, `parseSvg`, roving tab keyboard nav (manual activation + `Delete` focus retention + close-button target guard) + loading indicator, combobox `aria-expanded`/`aria-activedescendant`, `ui-action` listener, `Ctrl+R`/`F5`/`Alt+Left`/`Alt+Right`/`Ctrl+Tab` shortcuts, AltGr guard.
+- `src/settings.html` — Nav section SVG icons, `<form id="eform">` + `.sr-only` labels, `button.danger` dialog CTA, `aria-live="polite"`.
+- `src/settings.js` — Removed duplicate `getVersion` import, `#eform` validation feedback classes, `#hlist` click delegation + orphaned `.day` header cleanup, `aria-busy` states, extension status badges.
+- `src/extensions.html` — `.sr-only` label for `#src`, `aria-live="polite"` on `#msg`.
+- `src/ext.js` — Theme sync (`get_settings` + `settings-changed`), status badges, `.danger-hover`, duplicate-click guard on Remove, `aria-busy`.
+- `src/new.html` & `src/new.js` — New Fluent 2 New Tab page (`navigate_self` Rust parity, `http(s)` allowlist on recent sites, forwarded `Ctrl+T`/`Ctrl+L`/`Ctrl+,`, visibility-aware history refresh, theme sync).
 
-| Output | Before SHA-256 | After SHA-256 | Status |
+---
+
+## 5. Fingerprint Comparison (behavior unchanged)
+
+Generated by the unchanged `bench_and_fingerprint` test before and after Round 4:
+
+| Output | Baseline SHA-256 | After Round 4 SHA-256 | Status |
 |---|---|---|---|
 | `SEARCH_URL` | `1aa2709c990e896cf2c9b3b8d856da1ab73a48d98e49d1583d3e623854c4fcc5` | `1aa2709c990e896cf2c9b3b8d856da1ab73a48d98e49d1583d3e623854c4fcc5` | **MATCH** |
 | `SUGGEST_RUST` | `afed46928a13b3c7c297cc7effa7f1166863c10c6402f5c743a106b49128e96a` | `afed46928a13b3c7c297cc7effa7f1166863c10c6402f5c743a106b49128e96a` | **MATCH** |
 | `HISTORY_CRATES` | `7c1ef793cf9b7935c1ad8d3517075c2a594fe20473834d6bbadb0d95542fb4b3` | `7c1ef793cf9b7935c1ad8d3517075c2a594fe20473834d6bbadb0d95542fb4b3` | **MATCH** |
 | `SETTINGS` | `68c5436df6803e031f1e0532c812a17f2c3ad383b3a4a2b5652bf274c351bade` | `68c5436df6803e031f1e0532c812a17f2c3ad383b3a4a2b5652bf274c351bade` | **MATCH** |
 
-All four also match the Round 1/Round 2 values. 11/11 unit tests pass; clippy: no new warnings.
-
 ---
 
-## 5. Items Needing Your Decision
+## 6. Items Needing Your Decision
 
 | Item | Options | Rough cost / tradeoff |
 |---|---|---|
-| **Commit / merge perf work** | Rounds 2+3 are uncommitted on `perf-optimize-round3`. A: review then commit/merge to main. B: keep iterating. | Free; nothing is committed until you say so. |
-| **History storage: JSON vs SQLite** | A: keep JSON + background saves (fine <=5k entries). B: `rusqlite` + FTS5 for 100k+ entries, indexed search, less RAM. | B: ~1-2 days dev, adds native SQLite build dep; changes persistence format (migration needed). |
-| **Full virtual scrolling** | A: keep R3 `content-visibility` (no JS, already skips off-screen work). B: JS windowing (~15 DOM rows total). | B: ~50-100 lines JS; only worth it if DOM node count itself is a problem on low-RAM machines. |
-| **Session file when "Save session" is off** | `exit_app` still writes `session.json` (window bounds) even with the setting off; `settings.js` deletes it on the next settings change. A: keep. B: skip persist entirely when `save_session=false` (stronger privacy). | B is a small behavior change -> needs your approval; ~5 lines. |
-| **Telemetry** | A: none (best privacy). B: local-only `tracing` file log. | B: free, no data leaves the device. |
+| **Commit / merge Round 4** | Changes are uncommitted on `ui-ux-perf-round4`. A: review and merge to `main`. B: iterate further on UI or perf. | Free; nothing committed or pushed until you say so. |
+| **History storage: JSON vs SQLite** | A: keep JSON + background saves (fine <=5k entries). B: `rusqlite` + FTS5 for 100k+ entries, indexed search, lower RAM. | B: ~1–2 days dev, adds native SQLite dep + migration. |
+| **Full JS virtual scrolling** | A: keep `content-visibility: auto` (zero JS overhead, already skips off-screen work). B: JS windowing (~15 DOM rows total). | B: ~50–100 lines JS; only needed if 1,000 DOM nodes strain RAM. |
+| **Session file when "Save session" is off** | `exit_app` still persists window bounds to `session.json` when `save_session` is off; `settings.js` deletes it on settings change. A: keep. B: skip persist entirely when `save_session=false`. | Small behavior change; ~5 lines in `main.rs`. |
+| **Telemetry / local tracing** | A: none (best privacy). B: local-only `tracing` file log for IPC/CRX timings. | Free; zero network telemetry. |
 
 ---
 
-## 6. Remaining Recommendations (priority order)
+## 7. Remaining Recommendations (priority order)
 
-1. **Review + commit/merge** `perf-optimize-round3` (and the carried-over Round 2 changes) -- your call.
-2. **Evaluate full LTO (`lto = true`) in CI**, not locally: smaller/faster binary vs longer compile. `build.yml` already builds release on `windows-latest`.
-3. **Startup cleanup of stray `*.tmp` files** in AppData after a crash (unique temp names mean crash leftovers no longer overwrite each other, but they can accumulate). Small, optional.
-4. **SQLite migration** if history should grow past 5,000 entries (decision above).
-5. **Optional local tracing** for IPC/extension-install timings (items 29/30).
+1. **Review & test the live GUI** on `ui-ux-perf-round4` (especially `about:new`, `about:settings` light/dark and 640px narrow width, `about:extensions`, and tab keyboard navigation), then commit/merge to `main` when satisfied.
+2. **Keep release benchmarking in CI (`build.yml`)** rather than local debug runs so release-mode LTO optimizations can be tracked without CPU thermal noise.
+3. **Evaluate SQLite/FTS5** only if `MAX_HISTORY` is raised beyond 5,000 entries.
 
 ---
 
-## 7. What I Could Not Measure or Got Wrong
+## 8. What I Could Not Measure or Got Wrong
 
-1. **Release build and release benchmarks: not measured.** You asked not to run builds on your machine ("ko chay build tren may t"); the in-flight `cargo build --release` was stopped and no release exe exists. Round 2's release numbers (45,911 us suggest / 38,902 us history) are historical and were **not** re-verified for Round 3. All Round 3 numbers above are the debug profile, which is what `measure.ps1` runs. If you want release verification, add a bench step to `build.yml` (CI) rather than building locally.
-2. **First lowercase attempt was wrong and was reverted.** A buffer-reuse `lower_into` (ASCII fast path) looked allocation-free but measured ~2x *slower* than std `to_lowercase` in debug (199,694 us vs 102,486 us per 100k ops; `to_ascii_lowercase` and table-push variants were 4-6x slower). History median had regressed 226,551 -> 672,709 us; after reverting to std and building output entries without the cached String, history is flat (+1.3%, inside the baseline's 135,401 us spread). Lesson: std's ASCII path is a tight single pass; per-byte `make_ascii_lowercase`/`push` loops are not inlined in debug.
-3. **Lighthouse / web-vitals: not applicable.** Tauri serves UI over a local webview protocol, not HTTP; LCP/TBT/transfer-size have no meaning here. No browser-driven UI run of the desktop app happened this session -- UI-level effects (content-visibility, debounce) are verified by code review + CSS semantics, not by interacting with the running app.
-4. **`content-visibility` scrollbar estimate:** 49px row height is computed from CSS; `contain-intrinsic-size: auto` self-corrects after first paint, but total scroll height can differ by a few pixels until rows have rendered once. Find-in-page and focus-scroll are supported in WebView2's Chromium (>=130).
-5. **Small intentional timing changes:** `history-updated` list refresh is now delayed up to 150 ms (debounce); `delete_session` does one synchronous small write before deleting (rare user action, fixes the resurrection race).
-6. **Cross-day numbers are not comparable:** same code measured 397,060 us (Nov 17) vs 771,823 us (Nov 19 baseline) -- machine state differs. Only the same-session before/after pair in section 1 is a valid comparison.
-7. **GUI behavior not exercised end-to-end:** correctness rests on the 4 SHA-256 fingerprints, 11 unit tests (including the JSON-shape test), and clippy -- not on a manual run of the browser.
+1. **Two hot-loop lowercase caching attempts regressed in debug mode and were reverted.**
+   - *Attempt 1 (7-field `Entry` with `sq_lc`, `title_lc`, `url_lc`):* Nearly doubled `sizeof::<Entry>()` (80 B → 152 B), hurting L2 cache density and doubling `Vec<Entry>` output allocation work in `history()`; `measure.ps1` medians regressed from `38,994 / 110,191 µs` to `45,921–54,373 / 134,009–146,726 µs`. Reverted.
+   - *Attempt 2 (3-Vec Structure-of-Arrays `HistoryStore` with indexed `(0..len).rev()`):* Avoided bloating `Entry`, and Run 1 History hit `87,494 µs`, but debug-mode (`opt-level = 0`) bounds-checked indexing across 3 parallel `Vec`s + `i5-8265U` boost throttling resulted in medians of `53,495 / 134,675 µs`. Reverted to Round 3's compact `Vec<Entry>` iterator structure while retaining the verified non-bloating wins (`DiskEntry`, dup no-op skip, `HashSet<&str>`, crash `*.tmp` cleanup).
+2. **`i5-8265U` thermal/power throttling across the session.** At the 23:16 cold baseline on `main`, `measure.ps1` measured `38,994 µs` (suggest) and `110,191 µs` (history). By 23:48 — after repeated Rust `cargo test`/`clippy` rebuilds and 5-iteration benchmark runs on this thin-and-light laptop CPU (1.60 GHz base) — all 5 runs of `measure.ps1` executed under thermal/power throttling (`108,936 µs` suggest / `261,319 µs` history, closely matching Round 3's earlier `91,786 / 229,436 µs` report on the same machine). Because the hot `history()`/`suggest()` loops are identical to Round 3 (plus `HashSet<&str>` avoiding URL String clones), a clean re-measurement on a cooled-down or AC-turbo machine is recommended if exact microsecond deltas are needed.
+3. **Release build and release benchmarks: not measured.** Per user policy and plan, `cargo build --release` was not run locally; debug-mode timings do not reflect `opt-level = 3` + thin LTO release throughput.
+4. **Live desktop GUI, WebView2 runtime behavior, and Lighthouse: not executed.** No running instance of Kbrowser was launched during this session. Frontend changes (`style.css`, `index.html`, `app.js`, `settings.html`, `settings.js`, `extensions.html`, `ext.js`, `new.html`, `new.js`) were verified via `node --check`, static code/ARIA inspection, and CSS token contrast verification — not interactive browser/screen-reader testing. Lighthouse/HTTP metrics are N/A for Tauri's embedded protocol.

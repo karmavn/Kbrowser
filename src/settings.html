@@ -9,11 +9,26 @@
 <body class="settings">
   <nav id="nav" aria-label="Settings sections">
     <h1>Settings</h1>
-    <button class="navitem" data-pane="general" aria-current="page">General</button>
-    <button class="navitem" data-pane="appearance">Appearance</button>
-    <button class="navitem" data-pane="privacy">Privacy and history</button>
-    <button class="navitem" data-pane="extensions">Extensions</button>
-    <button class="navitem" data-pane="about">About</button>
+    <button class="navitem" data-pane="general" aria-current="page">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
+      <span>General</span>
+    </button>
+    <button class="navitem" data-pane="appearance">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      <span>Appearance</span>
+    </button>
+    <button class="navitem" data-pane="privacy">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 3l7 3v6c0 5-3.5 8-7 9-3.5-1-7-4-7-9V6l7-3z"/></svg>
+      <span>Privacy and history</span>
+    </button>
+    <button class="navitem" data-pane="extensions">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 5h4a2 2 0 1 1 4 0h6v5a2 2 0 1 1 0 4v5H5v-5a2 2 0 1 1 0-4V5z"/></svg>
+      <span>Extensions</span>
+    </button>
+    <button class="navitem" data-pane="about">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></svg>
+      <span>About</span>
+    </button>
   </nav>
 
   <main id="content">
@@ -37,12 +52,14 @@
       <h3 class="group">Custom search engines</h3>
       <p class="empty">Add any site that has a search page. Put <code>%s</code> where the search terms go, for example <code>https://example.com/search?q=%s</code>. Added engines appear in the list above.</p>
       <div id="elist"></div>
-      <div class="engine-add">
-        <input id="ename" class="field" type="text" spellcheck="false" autocomplete="off" placeholder="Name" aria-label="Search engine name">
-        <input id="eurl" class="field" type="text" spellcheck="false" autocomplete="off" placeholder="https://example.com/search?q=%s" aria-label="Search URL containing %s">
-        <button id="eadd" class="primary">Add</button>
-      </div>
-      <p id="emsg" class="empty" role="status"></p>
+      <form id="eform" class="engine-add">
+        <label for="ename" class="sr-only">Search engine name</label>
+        <input id="ename" class="field" type="text" spellcheck="false" autocomplete="off" placeholder="Name">
+        <label for="eurl" class="sr-only">Search URL containing %s</label>
+        <input id="eurl" class="field" type="text" spellcheck="false" autocomplete="off" placeholder="https://example.com/search?q=%s">
+        <button id="eadd" class="primary" type="submit">Add</button>
+      </form>
+      <p id="emsg" class="empty" role="status" aria-live="polite"></p>
     </section>
 
     <section class="pane" id="pane-appearance" hidden>
@@ -93,7 +110,7 @@
       </div>
       <h3 class="group">Installed</h3>
       <div id="xlist"></div>
-      <p id="xmsg" class="empty" role="status"></p>
+      <p id="xmsg" class="empty" role="status" aria-live="polite"></p>
     </section>
 
     <section class="pane" id="pane-about" hidden>
@@ -120,7 +137,7 @@
     </select>
     <div class="actions">
       <button id="dlg-cancel" class="subtle">Cancel</button>
-      <button id="dlg-ok" class="primary">Clear now</button>
+      <button id="dlg-ok" class="danger">Clear now</button>
     </div>
   </dialog>
 

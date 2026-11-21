@@ -1,9 +1,47 @@
 <!doctype html>
 <html lang="en">
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>New Page</title>
-        <link rel="stylesheet" href="style.css">
-    </head>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>New Tab</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="newtab">
+  <main class="newtab-shell">
+    <div class="newtab-brand">
+      <div class="newtab-logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <circle cx="12" cy="12" r="9"/>
+          <path d="M16.2 7.8l-2.6 5.8-5.8 2.6 2.6-5.8 5.8-2.6z"/>
+        </svg>
+      </div>
+      <h1>Kbrowser</h1>
+    </div>
+
+    <form id="new-search" class="search-pill" role="search">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
+      <label for="q" class="sr-only">Search or enter address</label>
+      <input id="q" type="text" spellcheck="false" autocomplete="off" placeholder="Search or enter address" autofocus>
+      <button class="primary" type="submit">Go</button>
+    </form>
+
+    <section id="recent-wrap" aria-label="Recent sites" hidden>
+      <h2 class="recent-head">Recent sites</h2>
+      <div id="recent" class="recent-grid"></div>
+    </section>
+
+    <footer class="newtab-footer">
+      <div class="newtab-actions">
+        <button id="open-settings" class="subtle" type="button">Settings</button>
+        <button id="open-extensions" class="subtle" type="button">Extensions</button>
+      </div>
+      <div class="kbd-hints" aria-hidden="true">
+        <span><kbd>Ctrl</kbd>+<kbd>T</kbd> New tab</span>
+        <span><kbd>Ctrl</kbd>+<kbd>L</kbd> Address bar</span>
+        <span><kbd>Ctrl</kbd>+<kbd>,</kbd> Settings</span>
+      </div>
+    </footer>
+  </main>
+  <script src="new.js"></script>
+</body>
 </html>

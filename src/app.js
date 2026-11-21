@@ -2,12 +2,29 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const $ = (s) => document.querySelector(s);
-const CLOSE_SVG = '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>';
-const CLOSE_ICON_NODE = (() => {
+const parseSvg = (markup) => {
   const d = document.createElement("div");
-  d.innerHTML = CLOSE_SVG;
-  return d.firstElementChild;
-})();
+  d.innerHTML = markup;
+  const svg = d.firstElementChild;
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  return svg;
+};
+
+const CLOSE_ICON_NODE = parseSvg('<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>');
+const LOADING_ICON_NODE = parseSvg('<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" stroke-dasharray="28" stroke-dashoffset="10"/></svg>');
+const SEARCH_ICON_NODE = parseSvg('<svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>');
+const PAGE_ICON_NODE = parseSvg('<svg viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></svg>');
+const MAX_ICON_NODE = parseSvg('<svg viewBox="0 0 10 10"><path d="M.5.5h9v9h-9z"/></svg>');
+const RESTORE_ICON_NODE = parseSvg('<svg viewBox="0 0 10 10"><path d="M2.5 2.5v-2h7v7h-2M.5 2.5h7v7h-7z"/></svg>');
+
+const $tabs = $("#tabs");
+const $progress = $("#progress");
+const $addr = $("#addr");
+const $add = $("#add");
+const $suggest = $("#suggest");
+const $winMax = $("#win-max");
+
 const INTERNAL = new Set(["about:extensions", "about:settings", "about:new"]);
 
 // Mirrors the Rust `Settings`; replaced by the saved values at startup.
@@ -35,7 +52,6 @@ const closingTabs = new Set();
 let shuttingDown = false;
 let restoring = true; // no saving while the old session is being reopened
 let lastSaved = "";
-
 
 async function openTab(url = settings.home) {
   if (shuttingDown) return;
@@ -69,7 +85,6 @@ async function openTab(url = settings.home) {
   }
 }
 
-
 // Internal pages (settings, extensions) reuse an already-open tab.
 function openInternal(url) {
   const found = [...tabs].find(([, t]) => t.url === url || shown(t.url) === url);
@@ -82,7 +97,40 @@ function activate(id) {
   invoke("activate_tab", { id });
 }
 
-async function closeTab(id) {
+function cycleTab(dir) {
+  const ids = [...tabs.keys()];
+  if (ids.length < 2) return;
+  const idx = ids.indexOf(active);
+  const next = ids[(idx + dir + ids.length) % ids.length];
+  if (next) activate(next);
+}
+
+function handleTabKey(e, id) {
+  if (e.target !== e.currentTarget) return;
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    activate(id);
+  } else if (e.key === "Delete") {
+    e.preventDefault();
+    closeTab(id, { keepFocus: true });
+  } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    e.preventDefault();
+    const ids = [...tabs.keys()];
+    const idx = ids.indexOf(id);
+    if (idx === -1) return;
+    const nextId = ids[(idx + (e.key === "ArrowRight" ? 1 : -1) + ids.length) % ids.length];
+    if (nextId && nextId !== id) {
+      e.currentTarget.setAttribute("tabindex", "-1");
+      const nextEl = $tabs.querySelector(`.tab[data-id="${nextId}"]`);
+      if (nextEl) {
+        nextEl.setAttribute("tabindex", "0");
+        nextEl.focus();
+      }
+    }
+  }
+}
+
+async function closeTab(id, { keepFocus = false } = {}) {
   if (shuttingDown || closingTabs.has(id) || !tabs.has(id)) {
     return;
   }
@@ -95,13 +143,21 @@ async function closeTab(id) {
   const wasActive = active === id;
   tabs.delete(id);
   const remaining = [...tabs.keys()];
+  const nextFocusId = remaining[Math.min(idx, remaining.length - 1)] ?? null;
 
   if (wasActive) {
-    active = remaining[Math.min(idx, remaining.length - 1)] ?? null;
+    active = nextFocusId;
   }
 
   // Optimistic UI: tab closes immediately with zero click delay
   render();
+  if (keepFocus && nextFocusId) {
+    const nextEl = $tabs.querySelector(`.tab[data-id="${nextFocusId}"]`);
+    if (nextEl) {
+      nextEl.setAttribute("tabindex", "0");
+      nextEl.focus();
+    }
+  }
 
   if (tabs.size === 0) {
     shuttingDown = true;
@@ -116,7 +172,7 @@ async function closeTab(id) {
   }
 
   if (wasActive && active) {
-    invoke("activate_tab", { id: active }).catch(() => {});
+    invoke("activate_tab", { id: active, focus: !keepFocus }).catch(() => {});
   }
 
   // Destroy the native webview asynchronously in the background
@@ -130,12 +186,18 @@ async function closeTab(id) {
 }
 
 function render() {
-  const root = $("#tabs");
-  const currentEls = Array.from(root.children);
-  const currentIds = currentEls.map((el) => el.dataset.id);
+  const currentEls = $tabs.children;
   const targetIds = Array.from(tabs.keys());
 
-  const sameIds = currentIds.length === targetIds.length && currentIds.every((id, i) => id === targetIds[i]);
+  let sameIds = currentEls.length === targetIds.length;
+  if (sameIds) {
+    for (let i = 0; i < targetIds.length; i++) {
+      if (currentEls[i].dataset.id !== targetIds[i]) {
+        sameIds = false;
+        break;
+      }
+    }
+  }
 
   if (sameIds) {
     // Fast path: update attributes and text in place without destroying DOM elements
@@ -144,11 +206,15 @@ function render() {
       const id = targetIds[i];
       const t = tabs.get(id);
       const isActive = id === active;
-      const expectedClass = "tab" + (isActive ? " active" : "");
+      const expectedClass = "tab" + (isActive ? " active" : "") + (t.loading ? " loading" : "");
       if (el.className !== expectedClass) el.className = expectedClass;
+      const selected = isActive ? "true" : "false";
+      if (el.getAttribute("aria-selected") !== selected) el.setAttribute("aria-selected", selected);
+      const ti = isActive ? "0" : "-1";
+      if (el.getAttribute("tabindex") !== ti) el.setAttribute("tabindex", ti);
       if (el.title !== t.title) {
         el.title = t.title;
-        const titleSpan = el.firstElementChild;
+        const titleSpan = el.children[1];
         if (titleSpan && titleSpan.textContent !== t.title) titleSpan.textContent = t.title;
       }
     }
@@ -156,11 +222,19 @@ function render() {
     // Structural change: build with DocumentFragment for single reflow
     const frag = document.createDocumentFragment();
     for (const [id, t] of tabs) {
+      const isActive = id === active;
       const el = document.createElement("div");
       el.dataset.id = id;
-      el.className = "tab" + (id === active ? " active" : "");
+      el.className = "tab" + (isActive ? " active" : "") + (t.loading ? " loading" : "");
       el.setAttribute("role", "tab");
+      el.setAttribute("aria-selected", isActive ? "true" : "false");
+      el.setAttribute("tabindex", isActive ? "0" : "-1");
       el.title = t.title;
+
+      const spin = document.createElement("span");
+      spin.className = "tab-spin";
+      spin.setAttribute("aria-hidden", "true");
+      spin.appendChild(LOADING_ICON_NODE.cloneNode(true));
 
       const title = document.createElement("span");
       title.className = "title";
@@ -172,18 +246,19 @@ function render() {
       x.appendChild(CLOSE_ICON_NODE.cloneNode(true));
       x.onclick = (e) => { e.stopPropagation(); closeTab(id); };
 
-      el.append(title, x);
+      el.append(spin, title, x);
       el.onclick = () => activate(id);
       el.onauxclick = (e) => { if (e.button === 1) closeTab(id); };
+      el.onkeydown = (e) => handleTabKey(e, id);
       frag.append(el);
     }
-    root.replaceChildren(frag);
+    $tabs.replaceChildren(frag);
   }
 
   const t = tabs.get(active);
-  $("#progress").classList.toggle("on", !!t?.loading);
-  if (document.activeElement !== $("#addr")) $("#addr").value = shown(t?.url);
-  $("#add").hidden = !storeId(t?.url);
+  $progress.classList.toggle("on", !!t?.loading);
+  if (document.activeElement !== $addr) $addr.value = shown(t?.url);
+  $add.hidden = !storeId(t?.url);
   saveSession();
 }
 
@@ -243,6 +318,11 @@ listen("tab-updated", ({ payload: p }) => {
 
 listen("open-tab", ({ payload: url }) => (INTERNAL.has(url) ? openInternal(url) : openTab(url)));
 listen("settings-changed", ({ payload }) => { settings = payload; applyTheme(); });
+listen("ui-action", ({ payload }) => {
+  if (payload === "new-tab") openTab();
+  else if (payload === "focus-addr") $addr.focus();
+  else if (payload === "open-settings") openInternal("about:settings");
+});
 
 const nav = (action) => active && invoke("nav", { id: active, action });
 $("#back").onclick = () => nav("back");
@@ -252,55 +332,43 @@ $("#new").onclick = () => openTab();
 $("#ext").onclick = () => openInternal("about:extensions");
 $("#settings").onclick = () => openInternal("about:settings");
 
-$("#add").onclick = async () => {
-  const btn = $("#add");
+$add.onclick = async () => {
   const id = storeId(tabs.get(active)?.url);
   if (!id) return;
-  btn.disabled = true;
-  btn.textContent = "Adding…";
+  $add.disabled = true;
+  $add.textContent = "Adding…";
   try {
     await invoke("install_extension", { input: id });
     openTab("about:extensions"); // shows the restart prompt
   } catch (e) {
-    btn.textContent = "Couldn’t add";
-    btn.title = String(e);
+    $add.textContent = "Couldn’t add";
+    $add.title = String(e);
     await new Promise((r) => setTimeout(r, 2500));
   }
-  btn.disabled = false;
-  btn.textContent = "Add to browser";
-  btn.title = "";
+  $add.disabled = false;
+  $add.textContent = "Add to browser";
+  $add.title = "";
 };
 
 // ---------- Address-bar suggestions (from the history) ----------
 // The UI webview is only 84px tall, so while the list is open it grows by the list's height
 // and the page webviews slide down by the same amount (see `set_suggest_height` in main.rs).
 const ROW_H = 40, PAD = 8;
-const SEARCH_SVG = '<svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>';
-const PAGE_SVG = '<svg viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></svg>';
-const SEARCH_ICON_NODE = (() => {
-  const d = document.createElement("div");
-  d.innerHTML = SEARCH_SVG;
-  return d.firstElementChild;
-})();
-const PAGE_ICON_NODE = (() => {
-  const d = document.createElement("div");
-  d.innerHTML = PAGE_SVG;
-  return d.firstElementChild;
-})();
 let rows = [];
 let sel = -1;
 let suggestTimer = 0;
 let suggestSeq = 0;
-
 let currentSuggestH = 0;
 
 function closeSuggest() {
   clearTimeout(suggestTimer);
   suggestSeq++; // drop any answer still on its way
+  $addr.setAttribute("aria-expanded", "false");
+  $addr.removeAttribute("aria-activedescendant");
   if (!rows.length && currentSuggestH === 0) return;
   rows = [];
   sel = -1;
-  $("#suggest").hidden = true;
+  $suggest.hidden = true;
   if (currentSuggestH !== 0) {
     currentSuggestH = 0;
     invoke("set_suggest_height", { height: 0 });
@@ -308,23 +376,32 @@ function closeSuggest() {
 }
 
 function updateSuggestSelection() {
-  const box = $("#suggest");
-  const children = box.children;
+  const children = $suggest.children;
   for (let i = 0; i < children.length; i++) {
-    children[i].classList.toggle("sel", i === sel);
+    const selected = i === sel;
+    children[i].classList.toggle("sel", selected);
+    children[i].setAttribute("aria-selected", selected ? "true" : "false");
+  }
+  if (sel >= 0 && children[sel]) {
+    $addr.setAttribute("aria-activedescendant", children[sel].id);
+  } else {
+    $addr.removeAttribute("aria-activedescendant");
   }
 }
 
 function paintSuggest() {
-  const box = $("#suggest");
   const frag = document.createDocumentFragment();
   rows.forEach((r, i) => {
+    const isSel = i === sel;
     const el = document.createElement("div");
-    el.className = "srow" + (i === sel ? " sel" : "");
+    el.id = "sopt-" + i;
+    el.className = "srow" + (isSel ? " sel" : "");
     el.setAttribute("role", "option");
+    el.setAttribute("aria-selected", isSel ? "true" : "false");
 
     const ico = document.createElement("span");
     ico.className = "sico";
+    ico.setAttribute("aria-hidden", "true");
     ico.appendChild((r.query != null ? SEARCH_ICON_NODE : PAGE_ICON_NODE).cloneNode(true));
 
     const main = document.createElement("span");
@@ -347,31 +424,33 @@ function paintSuggest() {
     el.onmousedown = (e) => { e.preventDefault(); pick(r); };
     frag.append(el);
   });
-  box.replaceChildren(frag);
+  $suggest.replaceChildren(frag);
 }
 
 function pick(r) {
-  addr.value = r.url;
+  $addr.value = r.url;
   closeSuggest();
   if (active) invoke("navigate", { id: active, input: r.url });
-  addr.blur();
+  $addr.blur();
 }
 
 //updates the suggested address bar inputs based on input and search history (if enabled)
 async function updateSuggest() {
   if (!settings.show_suggestions)
     return;
-  const q = addr.value.trim();
+  const q = $addr.value.trim();
   const seq = ++suggestSeq;
   if (!q || INTERNAL.has(q)) return closeSuggest();
   let list = [];
   try { list = await invoke("history_suggest", { query: q }); } catch {}
-  if (seq !== suggestSeq || document.activeElement !== addr) return; // stale answer
+  if (seq !== suggestSeq || document.activeElement !== $addr) return; // stale answer
   if (!list.length) { suggestSeq++; return closeSuggest(); }
   rows = list;
   sel = -1;
   paintSuggest();
-  $("#suggest").hidden = false;
+  $suggest.hidden = false;
+  $addr.setAttribute("aria-expanded", "true");
+  $addr.removeAttribute("aria-activedescendant");
   const targetH = rows.length * ROW_H + PAD;
   if (currentSuggestH !== targetH) {
     currentSuggestH = targetH;
@@ -380,72 +459,63 @@ async function updateSuggest() {
 }
 
 //address bar
-const addr = $("#addr");
-addr.onfocus = () => addr.select();
-addr.oninput = () => { clearTimeout(suggestTimer); suggestTimer = setTimeout(updateSuggest, 150); };
-addr.onblur = () => closeSuggest();
-addr.onkeydown = (e) => {
+$addr.onfocus = () => $addr.select();
+$addr.oninput = () => { clearTimeout(suggestTimer); suggestTimer = setTimeout(updateSuggest, 150); };
+$addr.onblur = () => closeSuggest();
+$addr.onkeydown = (e) => {
   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
     if (!rows.length) return;
     e.preventDefault();
     const n = rows.length;
     sel = e.key === "ArrowDown" ? (sel + 1) % n : (sel - 1 + n) % n;
     updateSuggestSelection();
-  } else if (e.key === "Enter" && active && addr.value.trim()) {
+  } else if (e.key === "Enter" && active && $addr.value.trim()) {
     if (sel >= 0 && rows[sel]) return pick(rows[sel]);
-    const v = addr.value.trim();
+    const v = $addr.value.trim();
     closeSuggest();
     if (INTERNAL.has(v)) openInternal(v);
-    else invoke("navigate", { id: active, input: addr.value });
-    addr.blur();
+    else invoke("navigate", { id: active, input: $addr.value });
+    $addr.blur();
   } else if (e.key === "Escape") {
     closeSuggest();
-    addr.blur();
+    $addr.blur();
     render();
   }
 };
 
 // Shortcuts work while the toolbar has focus; page focus needs native handling.
 window.addEventListener("keydown", (e) => {
-  if (!e.ctrlKey) return;
+  if (e.key === "F5") { e.preventDefault(); nav("reload"); return; }
+  if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); nav("back"); return; }
+  if (e.altKey && e.key === "ArrowRight") { e.preventDefault(); nav("forward"); return; }
+  if (!e.ctrlKey || e.altKey) return;
+  if (e.key === "Tab") { e.preventDefault(); cycleTab(e.shiftKey ? -1 : 1); return; }
   const k = e.key.toLowerCase();
   if (k === "t") { e.preventDefault(); openTab(); }
   else if (k === "w") { e.preventDefault(); active && closeTab(active); }
-  else if (k === "l") { e.preventDefault(); addr.focus(); }
+  else if (k === "l") { e.preventDefault(); $addr.focus(); }
+  else if (k === "r") { e.preventDefault(); nav("reload"); }
   else if (k === ",") { e.preventDefault(); openInternal("about:settings"); }
   else if (k === "n") { e.preventDefault(); openInternal("about:new"); }
 });
 
 // Custom window frame: drag is handled natively by data-tauri-drag-region, double-click to maximize.
-const MAX_SVG = '<svg viewBox="0 0 10 10"><path d="M.5.5h9v9h-9z"/></svg>';
-const RESTORE_SVG = '<svg viewBox="0 0 10 10"><path d="M2.5 2.5v-2h7v7h-2M.5 2.5h7v7h-7z"/></svg>';
-const MAX_ICON_NODE = (() => {
-  const d = document.createElement("div");
-  d.innerHTML = MAX_SVG;
-  return d.firstElementChild;
-})();
-const RESTORE_ICON_NODE = (() => {
-  const d = document.createElement("div");
-  d.innerHTML = RESTORE_SVG;
-  return d.firstElementChild;
-})();
 $("#strip").addEventListener("dblclick", (e) => {
   if (e.target.closest(".tab, button")) return;
   invoke("win_toggle_maximize");
 });
 //window controls
 $("#win-min").onclick = () => invoke("win_minimize");
-$("#win-max").onclick = () => invoke("win_toggle_maximize");
+$winMax.onclick = () => invoke("win_toggle_maximize");
 $("#win-close").onclick = () => invoke("win_close");
 let lastMax = null;
 async function syncMax() {
   const max = await invoke("win_is_maximized");
   if (max === lastMax) return; // unchanged: skip the DOM write on every resize tick
   lastMax = max;
-  const b = $("#win-max");
-  b.replaceChildren((max ? RESTORE_ICON_NODE : MAX_ICON_NODE).cloneNode(true));
-  b.title = max ? "Restore" : "Maximize";
-  b.setAttribute("aria-label", b.title);
+  $winMax.replaceChildren((max ? RESTORE_ICON_NODE : MAX_ICON_NODE).cloneNode(true));
+  $winMax.title = max ? "Restore" : "Maximize";
+  $winMax.setAttribute("aria-label", $winMax.title);
 }
 let resizeTimer;
 window.addEventListener("resize", () => {

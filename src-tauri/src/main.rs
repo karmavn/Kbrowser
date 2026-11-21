@@ -85,10 +85,10 @@ fn configure(
 //parses different url types
 fn normalize(input: &str, data: &data::Data) -> String {
     let s = input.trim();
-    if let Ok(u) = Url::parse(s) {
-        if matches!(u.scheme(), "http" | "https" | "file" | "chrome-extension") {
-            return s.to_string();
-        }
+    if let Ok(u) = Url::parse(s)
+        && matches!(u.scheme(), "http" | "https" | "file" | "chrome-extension")
+    {
+        return s.to_string();
     }
     if !s.contains(char::is_whitespace) {
         if s.starts_with("localhost") {
@@ -109,17 +109,17 @@ fn url_from_args(args: &[String], cwd: Option<&Path>) -> Option<String> {
         if a.is_empty() || a.starts_with('-') {
             continue;
         }
-        if let Ok(u) = Url::parse(a) {
-            if matches!(u.scheme(), "http" | "https" | "file" | "chrome-extension") {
-                return Some(u.to_string());
-            }
+        if let Ok(u) = Url::parse(a)
+            && matches!(u.scheme(), "http" | "https" | "file" | "chrome-extension")
+        {
+            return Some(u.to_string());
         }
         // Not a URL: treat it as a file path ("C:\x\a.html" parses as scheme "c", so it lands here).
         let mut p = PathBuf::from(a);
-        if p.is_relative() {
-            if let Some(c) = cwd {
-                p = c.join(p);
-            }
+        if p.is_relative()
+            && let Some(c) = cwd
+        {
+            p = c.join(p);
         }
         if let Ok(full) = p.canonicalize() {
             let s = full.to_string_lossy();
@@ -161,7 +161,7 @@ fn layout(window: &Window) {
             )));
         } else if name.starts_with("tab-") {
             // Only update position/size for the visible active tab to prevent background GPU/DWM thrashing
-            if active_label.as_ref().map_or(true, |act| act == &name) {
+            if active_label.as_ref().is_none_or(|act| act == &name) {
                 let _ = wv.set_position(Position::Logical(LogicalPosition::new(
                     0.0,
                     CHROME_H + extra,
@@ -172,42 +172,46 @@ fn layout(window: &Window) {
     }
 }
 
-fn show_only(app: &AppHandle, id: &str) {
+fn show_only(app: &AppHandle, id: &str, focus_content: bool) {
     let keep = label(id);
     if let Some(act) = app.try_state::<ActiveTab>() {
         *act.0.lock().unwrap() = Some(keep.clone());
     }
     // Update newly visible tab dimensions immediately before showing
-    if let Some(w) = app.get_window("main") {
-        if let (Ok(scale), Ok(px)) = (w.scale_factor(), w.inner_size()) {
-            let size = px.to_logical::<f64>(scale);
-            let content_h = (size.height - CHROME_H).max(0.0);
-            let extra = *app.state::<Suggest>().0.lock().unwrap();
+    if let Some(w) = app.get_window("main")
+        && let (Ok(scale), Ok(px)) = (w.scale_factor(), w.inner_size())
+    {
+        let size = px.to_logical::<f64>(scale);
+        let content_h = (size.height - CHROME_H).max(0.0);
+        let extra = *app.state::<Suggest>().0.lock().unwrap();
 
-            for (name, wv) in app.webviews() {
-                if name.starts_with("tab-") {
-                    if name == keep {
-                        let _ = wv.set_position(Position::Logical(LogicalPosition::new(
-                            0.0,
-                            CHROME_H + extra,
-                        )));
-                        let _ = wv.set_size(Size::Logical(LogicalSize::new(size.width, content_h)));
-                        let _ = wv.show();
+        for (name, wv) in app.webviews() {
+            if name.starts_with("tab-") {
+                if name == keep {
+                    let _ = wv.set_position(Position::Logical(LogicalPosition::new(
+                        0.0,
+                        CHROME_H + extra,
+                    )));
+                    let _ = wv.set_size(Size::Logical(LogicalSize::new(size.width, content_h)));
+                    let _ = wv.show();
+                    if focus_content {
                         let _ = wv.set_focus();
-                    } else {
-                        let _ = wv.hide();
                     }
+                } else {
+                    let _ = wv.hide();
                 }
             }
-            return;
         }
+        return;
     }
 
     for (name, wv) in app.webviews() {
         if name.starts_with("tab-") {
             if name == keep {
                 let _ = wv.show();
-                let _ = wv.set_focus();
+                if focus_content {
+                    let _ = wv.set_focus();
+                }
             } else {
                 let _ = wv.hide();
             }
@@ -347,10 +351,10 @@ fn delete_session(app: AppHandle, state: State<'_, SessionState>) -> Result<(), 
     persist_sync(&app);
 
     //Optional hard-deletion: Clean up the session file completely from the disk
-    if let Some(path) = session_path(&app) {
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-        }
+    if let Some(path) = session_path(&app)
+        && path.exists()
+    {
+        let _ = std::fs::remove_file(path);
     }
 
     Ok(())
@@ -456,14 +460,14 @@ async fn new_tab(app: AppHandle, id: String, url: String) -> Result<(), String> 
             LogicalSize::new(size.width, (size.height - CHROME_H).max(0.0)),
         )
         .map_err(|e| e.to_string())?;
-    show_only(&app, &id);
+    show_only(&app, &id, true);
     Ok(())
 }
 
 ///shows the given tabs contents.
 #[tauri::command]
-async fn activate_tab(app: AppHandle, id: String) {
-    show_only(&app, &id);
+async fn activate_tab(app: AppHandle, id: String, focus: Option<bool>) {
+    show_only(&app, &id, focus.unwrap_or(true));
 }
 
 ///closes a tab.
@@ -495,6 +499,45 @@ async fn navigate(app: AppHandle, id: String, input: String) -> Result<(), Strin
             .map_err(|e| e.to_string())?
     };
     wv.navigate(url).map_err(|e| e.to_string())
+}
+
+/// Navigates the calling tab webview (used by internal pages such as `about:new`),
+/// delegating to `normalize` so search encoding and local/extension schemes match the address bar.
+#[tauri::command]
+async fn navigate_self(
+    webview: tauri::Webview,
+    app: AppHandle,
+    input: String,
+) -> Result<(), String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if matches!(trimmed, "about:extensions" | "about:settings" | "about:new") {
+        let _ = app.emit("open-tab", trimmed.to_string());
+        return Ok(());
+    }
+    let url = {
+        let data = app.state::<data::Data>();
+        normalize(trimmed, &data)
+            .parse::<Url>()
+            .map_err(|e| e.to_string())?
+    };
+    webview.navigate(url).map_err(|e| e.to_string())
+}
+
+/// Forwards keyboard chrome actions from internal pages (`about:new`) to the `ui` webview.
+#[tauri::command]
+async fn ui_action(app: AppHandle, action: String) {
+    if !matches!(action.as_str(), "new-tab" | "focus-addr" | "open-settings") {
+        return;
+    }
+    if action == "focus-addr"
+        && let Some(ui) = app.get_webview("ui")
+    {
+        let _ = ui.set_focus();
+    }
+    let _ = app.emit("ui-action", action);
 }
 
 ///this is the navbar
@@ -688,6 +731,8 @@ fn main() {
             close_tab,
             exit_app,
             navigate,
+            navigate_self,
+            ui_action,
             nav,
             install_extension,
             list_extensions,
