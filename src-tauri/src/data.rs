@@ -3,9 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    path::PathBuf,
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    path::{Path, PathBuf},
+    sync::{Mutex, mpsc},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::Url;
 
@@ -83,8 +83,147 @@ fn snapshot_disk(entries: &[Entry]) -> Vec<DiskEntry> {
         .collect()
 }
 
+enum WriteOp {
+    WriteJson {
+        path: PathBuf,
+        serialize: Box<dyn FnOnce() -> Option<Vec<u8>> + Send>,
+    },
+    Delete {
+        path: PathBuf,
+    },
+    Flush(mpsc::SyncSender<()>),
+}
+
+enum FileAction {
+    Write(Box<dyn FnOnce() -> Option<Vec<u8>> + Send>),
+    Delete,
+}
+
+pub(crate) struct DiskWriter {
+    tx: Option<mpsc::Sender<WriteOp>>,
+}
+
+impl DiskWriter {
+    fn new(enabled: bool) -> Self {
+        if !enabled {
+            return Self { tx: None };
+        }
+        let (tx, rx) = mpsc::channel::<WriteOp>();
+        std::thread::spawn(move || {
+            let mut seq: u64 = 0;
+            while let Ok(first) = rx.recv() {
+                let mut pending = vec![first];
+                while let Ok(next) = rx.try_recv() {
+                    let is_flush = matches!(next, WriteOp::Flush(_));
+                    pending.push(next);
+                    if is_flush {
+                        break;
+                    }
+                }
+
+                let mut batch: Vec<(PathBuf, FileAction)> = Vec::new();
+                let mut flushes: Vec<mpsc::SyncSender<()>> = Vec::new();
+                for op in pending {
+                    match op {
+                        WriteOp::WriteJson { path, serialize } => {
+                            if let Some(pos) = batch.iter().position(|(p, _)| p == &path) {
+                                batch[pos].1 = FileAction::Write(serialize);
+                            } else {
+                                batch.push((path, FileAction::Write(serialize)));
+                            }
+                        }
+                        WriteOp::Delete { path } => {
+                            if let Some(pos) = batch.iter().position(|(p, _)| p == &path) {
+                                batch[pos].1 = FileAction::Delete;
+                            } else {
+                                batch.push((path, FileAction::Delete));
+                            }
+                        }
+                        WriteOp::Flush(ack) => flushes.push(ack),
+                    }
+                }
+
+                for (path, action) in batch {
+                    match action {
+                        FileAction::Write(serialize) => {
+                            if let Some(bytes) = serialize() {
+                                write_atomic(&path, &bytes, &mut seq);
+                            }
+                        }
+                        FileAction::Delete => {
+                            let _ = fs::remove_file(&path);
+                        }
+                    }
+                }
+
+                for ack in flushes {
+                    let _ = ack.send(());
+                }
+            }
+        });
+        Self { tx: Some(tx) }
+    }
+
+    pub(crate) fn write_json<T: Serialize + Send + 'static>(&self, path: PathBuf, value: T) {
+        let Some(tx) = &self.tx else { return };
+        let _ = tx.send(WriteOp::WriteJson {
+            path,
+            serialize: Box::new(move || serde_json::to_vec(&value).ok()),
+        });
+    }
+
+    pub(crate) fn delete_file(&self, path: PathBuf) {
+        let Some(tx) = &self.tx else { return };
+        let _ = tx.send(WriteOp::Delete { path });
+    }
+
+    pub(crate) fn flush(&self) {
+        let Some(tx) = &self.tx else { return };
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        if tx.send(WriteOp::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(Duration::from_secs(5));
+        }
+    }
+}
+
+fn write_atomic(path: &Path, bytes: &[u8], seq: &mut u64) {
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    *seq = seq.wrapping_add(1);
+    let fname = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("data.json");
+    let tmp = path.with_file_name(format!("{fname}.{}.{}.tmp", now(), *seq));
+    if fs::write(&tmp, bytes).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return;
+    }
+    for attempt in 0..3 {
+        if fs::rename(&tmp, path).is_ok() {
+            return;
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let _ = fs::remove_file(&tmp);
+}
+
+pub(crate) fn backup_corrupt(path: &Path) {
+    if path.exists() {
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("data.json");
+        let _ = fs::rename(path, path.with_file_name(format!("{fname}.corrupt")));
+    }
+}
+
 pub struct Data {
     dir: Option<PathBuf>,
+    writer: DiskWriter,
     settings: Mutex<Settings>,
     history: Mutex<Vec<Entry>>,
 }
@@ -109,6 +248,21 @@ fn encode(s: &str) -> String {
     out
 }
 
+fn is_google_tld(tld: &str) -> bool {
+    let mut parts = tld.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(a), None, None) => {
+            (2..=3).contains(&a.len()) && a.bytes().all(|b| b.is_ascii_lowercase())
+        }
+        (Some(a), Some(b), None) => {
+            matches!(a, "co" | "com" | "ne" | "off")
+                && (2..=3).contains(&b.len())
+                && b.bytes().all(|c| c.is_ascii_lowercase())
+        }
+        _ => false,
+    }
+}
+
 /// Fast check for well-known search engine host names without heap allocations.
 fn is_known_search_host(host: &str) -> bool {
     const KNOWN: &[&str] = &["duckduckgo.com", "bing.com", "brave.com", "ecosia.org"];
@@ -119,7 +273,8 @@ fn is_known_search_host(host: &str) -> bool {
             return true;
         }
     }
-    host.starts_with("www.google.") || host.starts_with("google.")
+    let g = host.strip_prefix("www.").unwrap_or(host);
+    g.strip_prefix("google.").is_some_and(is_google_tld)
 }
 
 /// The search terms if `url` is a results page of a well-known search engine.
@@ -180,46 +335,61 @@ impl Data {
                 }
             }
         }
-        let read = |name: &str| {
-            dir.as_ref()
-                .and_then(|d| fs::read_to_string(d.join(name)).ok())
+        let load_json = |name: &str| -> Option<String> {
+            dir.as_ref().and_then(|d| fs::read_to_string(d.join(name)).ok())
         };
-        let settings: Settings = read("settings.json")
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
-        let mut history: Vec<Entry> = read("history.json")
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
+        let settings: Settings = match load_json("settings.json") {
+            Some(t) if !t.trim().is_empty() => match serde_json::from_str(&t) {
+                Ok(v) => v,
+                Err(_) => {
+                    if let Some(d) = &dir {
+                        backup_corrupt(&d.join("settings.json"));
+                    }
+                    Settings::default()
+                }
+            },
+            _ => Settings::default(),
+        };
+        let mut history: Vec<Entry> = match load_json("history.json") {
+            Some(t) if !t.trim().is_empty() => match serde_json::from_str(&t) {
+                Ok(v) => v,
+                Err(_) => {
+                    if let Some(d) = &dir {
+                        backup_corrupt(&d.join("history.json"));
+                    }
+                    vec![]
+                }
+            },
+            _ => vec![],
+        };
         // Parse each URL once at load time; suggest() then never re-parses.
         for e in &mut history {
             e.sq = search_query(&e.url);
         }
+        let writer = DiskWriter::new(dir.is_some());
         Self {
             dir,
+            writer,
             settings: Mutex::new(settings),
             history: Mutex::new(history),
         }
     }
 
-    fn save<T: Serialize>(&self, name: &str, value: &T) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        // Unique temp names: two saves in the same millisecond must not share a
-        // `.tmp` file (concurrent writes to one path could corrupt the rename).
-        static SEQ: AtomicU64 = AtomicU64::new(0);
+    pub(crate) fn write_json<T: Serialize + Send + 'static>(&self, path: PathBuf, value: T) {
+        self.writer.write_json(path, value);
+    }
+
+    pub(crate) fn delete_file(&self, path: PathBuf) {
+        self.writer.delete_file(path);
+    }
+
+    pub(crate) fn flush(&self) {
+        self.writer.flush();
+    }
+
+    fn save<T: Serialize + Send + 'static>(&self, name: &str, value: T) {
         let Some(dir) = &self.dir else { return };
-        let _ = fs::create_dir_all(dir);
-        let Ok(text) = serde_json::to_vec(value) else {
-            return;
-        };
-        let dir = dir.clone();
-        let name = name.to_string();
-        std::thread::spawn(move || {
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let tmp = dir.join(format!("{name}.{}.{seq}.tmp", now()));
-            if fs::write(&tmp, text).is_ok() {
-                let _ = fs::rename(&tmp, dir.join(name));
-            }
-        });
+        self.writer.write_json(dir.join(name), value);
     }
 
     // --- Settings -------------------------------------------------------------
@@ -230,6 +400,7 @@ impl Data {
 
     /// Validates, stores and returns the settings actually saved.
     pub fn set_settings(&self, mut s: Settings) -> Settings {
+        const BUILTIN: &[&str] = &["duckduckgo", "google", "bing", "brave", "ecosia"];
         s.home = s.home.trim().to_string();
         if s.home.is_empty() {
             s.home = DEFAULT_HOME.into();
@@ -237,22 +408,25 @@ impl Data {
         if !matches!(s.theme.as_str(), "light" | "dark") {
             s.theme = "system".into();
         }
-        // Keep only well-formed custom engines: a name, an http(s) URL and a %s placeholder.
+        // Keep only well-formed custom engines: non-builtin ID, name, valid http(s) URL (non-tauri.localhost), %s.
         s.custom_engines.retain(|e| {
-            !e.id.trim().is_empty()
+            let id = e.id.trim();
+            !id.is_empty()
+                && !BUILTIN.contains(&id)
                 && !e.name.trim().is_empty()
-                && (e.url.starts_with("http://") || e.url.starts_with("https://"))
                 && e.url.contains("%s")
+                && Url::parse(&e.url.replace("%s", "test")).is_ok_and(|u| {
+                    matches!(u.scheme(), "http" | "https")
+                        && u.host_str().is_some_and(|h| h != "tauri.localhost")
+                })
         });
-        let known = matches!(
-            s.search.as_str(),
-            "duckduckgo" | "google" | "bing" | "brave" | "ecosia"
-        ) || s.custom_engines.iter().any(|e| e.id == s.search);
+        let known = BUILTIN.contains(&s.search.as_str())
+            || s.custom_engines.iter().any(|e| e.id == s.search);
         if !known {
             s.search = "duckduckgo".into();
         }
         *self.settings.lock().unwrap() = s.clone();
-        self.save("settings.json", &s);
+        self.save("settings.json", s.clone());
         s
     }
 
@@ -287,11 +461,20 @@ impl Data {
         if !self.settings.lock().unwrap().save_history {
             return false;
         }
+        if url.len() > 4096 {
+            return false;
+        }
         let Ok(u) = Url::parse(url) else { return false };
         if !matches!(u.scheme(), "http" | "https") || u.host_str() == Some("tauri.localhost") {
             return false;
         }
-        let (t, title) = (now(), title.trim());
+        let t = now();
+        let title_trimmed = title.trim();
+        let title: String = if title_trimmed.chars().count() > 512 {
+            title_trimmed.chars().take(512).collect()
+        } else {
+            title_trimmed.to_string()
+        };
         let mut h = self.history.lock().unwrap();
         let dup =
             matches!(h.last(), Some(l) if l.url == url && t.saturating_sub(l.time) < DEDUPE_MS);
@@ -300,23 +483,23 @@ impl Data {
                 return false;
             }
             if let Some(l) = h.last_mut() {
-                l.title = title.to_string();
+                l.title = title;
             }
         } else {
             h.push(Entry {
                 url: url.to_string(),
-                title: title.to_string(),
+                title,
                 time: t,
                 sq: search_query(url),
             });
             let extra = h.len().saturating_sub(MAX_HISTORY);
             h.drain(..extra);
         }
-        // Serialize outside the history lock so suggest()/history() are not blocked
-        // by the JSON encoding of up to 5,000 entries on every page visit.
+        // Serialize on the background writer thread so suggest()/history() and the UI
+        // thread are never stalled by encoding up to 5,000 entries on every page visit.
         let snapshot = snapshot_disk(&h);
         drop(h);
-        self.save("history.json", &snapshot);
+        self.save("history.json", snapshot);
         true
     }
 
@@ -402,32 +585,72 @@ impl Data {
         out
     }
 
+    /// Up to `limit` distinct recently visited non-search sites, newest first.
+    pub fn recent_sites(&self, limit: usize) -> Vec<Entry> {
+        let limit = limit.min(24);
+        if limit == 0 {
+            return vec![];
+        }
+        let h = self.history.lock().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::with_capacity(limit);
+        for e in h.iter().rev() {
+            if e.sq.is_some() {
+                continue;
+            }
+            let Ok(u) = Url::parse(&e.url) else { continue };
+            if !matches!(u.scheme(), "http" | "https") {
+                continue;
+            }
+            let Some(raw_host) = u.host_str() else { continue };
+            if raw_host == "tauri.localhost" {
+                continue;
+            }
+            let host = raw_host.strip_prefix("www.").unwrap_or(raw_host).to_string();
+            if host.is_empty() || !seen.insert(host) {
+                continue;
+            }
+            out.push(Entry {
+                url: e.url.clone(),
+                title: e.title.clone(),
+                time: e.time,
+                sq: None,
+            });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
     pub fn remove(&self, time: u64, url: &str) {
         let mut h = self.history.lock().unwrap();
         h.retain(|e| !(e.time == time && e.url == url));
         let snapshot = snapshot_disk(&h);
         drop(h);
-        self.save("history.json", &snapshot);
+        self.save("history.json", snapshot);
     }
 
-    /// range: "hour" | "day" | "week" | anything else = everything.
+    /// range: "hour" | "day" | "week" | "all". Unknown values are ignored.
     pub fn clear(&self, range: &str) {
-        let span: u64 = match range {
-            "hour" => 3_600_000,
-            "day" => 86_400_000,
-            "week" => 604_800_000,
-            _ => 0,
+        let span: Option<u64> = match range {
+            "hour" => Some(3_600_000),
+            "day" => Some(86_400_000),
+            "week" => Some(604_800_000),
+            "all" => None,
+            _ => return,
         };
         let mut h = self.history.lock().unwrap();
-        if span == 0 {
-            h.clear();
-        } else {
-            let cutoff = now().saturating_sub(span);
-            h.retain(|e| e.time < cutoff);
+        match span {
+            None => h.clear(),
+            Some(ms) => {
+                let cutoff = now().saturating_sub(ms);
+                h.retain(|e| e.time < cutoff);
+            }
         }
         let snapshot = snapshot_disk(&h);
         drop(h);
-        self.save("history.json", &snapshot);
+        self.save("history.json", snapshot);
     }
 }
 
@@ -649,6 +872,117 @@ pub mod tests {
     }
 
     #[test]
+    fn test_is_known_search_host_rejects_lookalikes() {
+        assert!(is_known_search_host("google.com"));
+        assert!(is_known_search_host("www.google.co.uk"));
+        assert!(is_known_search_host("www.google.com.vn"));
+        assert!(is_known_search_host("google.de"));
+        assert!(is_known_search_host("duckduckgo.com"));
+        assert!(is_known_search_host("search.brave.com"));
+        assert!(!is_known_search_host("google.evil.com"));
+        assert!(!is_known_search_host("www.google.evil.com"));
+        assert!(!is_known_search_host("evilduckduckgo.com"));
+        assert!(!is_known_search_host("google.123"));
+    }
+
+    #[test]
+    fn test_clear_requires_explicit_all() {
+        let data = Data::load(None);
+        assert!(data.add_history("https://example.com/1", "One"));
+        assert_eq!(data.history("").len(), 1);
+        data.clear("invalid_range");
+        assert_eq!(data.history("").len(), 1);
+        data.clear("all");
+        assert!(data.history("").is_empty());
+    }
+
+    #[test]
+    fn test_custom_engine_validation() {
+        let data = Data::load(None);
+        let s = Settings {
+            custom_engines: vec![
+                Engine {
+                    id: "google".into(),
+                    name: "Shadow".into(),
+                    url: "https://evil.test/?q=%s".into(),
+                },
+                Engine {
+                    id: "local".into(),
+                    name: "Local".into(),
+                    url: "http://tauri.localhost/?q=%s".into(),
+                },
+                Engine {
+                    id: "badurl".into(),
+                    name: "Bad".into(),
+                    url: "https://exa mple.com/?q=%s".into(),
+                },
+                Engine {
+                    id: "ok".into(),
+                    name: "Valid".into(),
+                    url: "https://example.org/search?q=%s".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let saved = data.set_settings(s);
+        assert_eq!(saved.custom_engines.len(), 1);
+        assert_eq!(saved.custom_engines[0].id, "ok");
+    }
+
+    #[test]
+    fn test_ordered_writer_no_resurrection() {
+        let dir = std::env::temp_dir().join(format!(
+            "kbrowser_writer_order_{}_{}",
+            std::process::id(),
+            now()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let data = Data::load(Some(dir.clone()));
+        for i in 0..500 {
+            data.add_history(&format!("https://example.com/{i}"), &format!("Title {i}"));
+        }
+        data.clear("all");
+        data.flush();
+
+        let disk = fs::read_to_string(dir.join("history.json")).unwrap();
+        let entries: Vec<Entry> = serde_json::from_str(&disk).unwrap();
+        assert!(entries.is_empty(), "cleared history must not be resurrected");
+        let stray_tmp = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!stray_tmp, "no .tmp files should remain after flush");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_recent_sites() {
+        let data = Data::load(None);
+        data.add_history("https://duckduckgo.com/?q=rust", "DuckDuckGo");
+        for i in 0..8 {
+            data.add_history(&format!("https://site{i}.example.org/page"), &format!("Site {i}"));
+        }
+        data.add_history("https://www.site7.example.org/other", "Site 7 again");
+        let recent = data.recent_sites(6);
+        assert_eq!(recent.len(), 6);
+        assert!(recent[0].url.contains("site7.example.org"));
+        assert!(!recent.iter().any(|e| e.url.contains("duckduckgo.com")));
+    }
+
+    #[test]
+    fn test_history_length_caps() {
+        let data = Data::load(None);
+        let long_url = format!("https://example.com/{}", "a".repeat(5000));
+        assert!(!data.add_history(&long_url, "Too long"));
+        let long_title = "Việt Nam 🚀 ".repeat(1000);
+        assert!(data.add_history("https://example.com/ok", &long_title));
+        let h = data.history("");
+        assert_eq!(h.len(), 1);
+        assert!(h[0].title.chars().count() <= 512);
+    }
+
+    #[test]
+    #[ignore]
     fn bench_and_fingerprint() {
         use sha2::{Sha256, Digest};
         use std::time::Instant;

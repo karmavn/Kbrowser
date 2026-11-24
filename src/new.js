@@ -2,7 +2,7 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const $ = (s) => document.querySelector(s);
-const SEARCH_HOST = /(^|\.)(duckduckgo\.com|google\.[a-z.]+|bing\.com|brave\.com|ecosia\.org)$/;
+const SEARCH_HOST = /^(?:(?:[a-z0-9-]+\.)*(?:duckduckgo\.com|bing\.com|brave\.com|ecosia\.org)|(?:www\.)?google\.(?:[a-z]{2,3}|(?:co|com)\.[a-z]{2,3}))$/i;
 
 let settings = { theme: "system" };
 
@@ -103,7 +103,7 @@ let historyDirty = false;
 function scheduleRefresh() {
   clearTimeout(reloadTimer);
   reloadTimer = setTimeout(async () => {
-    const items = await invoke("history_list", { query: "" }).catch(() => []);
+    const items = await invoke("recent_sites", { limit: 6 }).catch(() => []);
     renderRecent(items);
   }, 150);
 }
@@ -126,7 +126,7 @@ document.addEventListener("visibilitychange", () => {
 (async () => {
   const [initSettings, items] = await Promise.all([
     invoke("get_settings").catch(() => null),
-    invoke("history_list", { query: "" }).catch(() => []),
+    invoke("recent_sites", { limit: 6 }).catch(() => []),
   ]);
   if (initSettings) settings = { ...settings, ...initSettings };
   applyTheme();

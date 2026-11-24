@@ -317,7 +317,17 @@ listen("tab-updated", ({ payload: p }) => {
 });
 
 listen("open-tab", ({ payload: url }) => (INTERNAL.has(url) ? openInternal(url) : openTab(url)));
-listen("settings-changed", ({ payload }) => { settings = payload; applyTheme(); });
+listen("settings-changed", ({ payload }) => {
+  if (!payload) return;
+  const wasSaveSession = settings.save_session;
+  settings = payload;
+  applyTheme();
+  if (!settings.show_suggestions) closeSuggest();
+  if (!wasSaveSession && settings.save_session) {
+    lastSaved = "";
+    saveSession();
+  }
+});
 listen("ui-action", ({ payload }) => {
   if (payload === "new-tab") openTab();
   else if (payload === "focus-addr") $addr.focus();

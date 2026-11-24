@@ -342,52 +342,48 @@ fn session_path(app: &AppHandle) -> Option<PathBuf> {
 }
 
 fn read_session(app: &AppHandle) -> Session {
-    session_path(app)
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-/// Writes the in-memory session to disk asynchronously in a background thread.
-fn persist(app: &AppHandle) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    // Unique temp names: two saves in the same millisecond must not share a
-    // `.tmp` file (concurrent writes to one path could corrupt the rename).
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let s = app.state::<SessionState>().0.lock().unwrap().clone();
-    let Some(path) = session_path(app) else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    let Some(p) = session_path(app) else {
+        return Session::default();
+    };
+    let Ok(text) = std::fs::read_to_string(&p) else {
+        return Session::default();
+    };
+    if text.trim().is_empty() {
+        return Session::default();
     }
-    if let Ok(bytes) = serde_json::to_vec(&s) {
-        let dir = path.parent().map(|p| p.to_path_buf());
-        std::thread::spawn(move || {
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let tmp = if let Some(d) = dir {
-                d.join(format!("session.{}.{seq}.tmp", data::now()))
-            } else {
-                path.with_extension("json.tmp")
-            };
-            if std::fs::write(&tmp, bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
-        });
-    }
-}
-
-/// Synchronous write on app shutdown to ensure session data is fully flushed.
-fn persist_sync(app: &AppHandle) {
-    let s = app.state::<SessionState>().0.lock().unwrap().clone();
-    let Some(path) = session_path(app) else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(bytes) = serde_json::to_vec(&s) {
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+    match serde_json::from_str(&text) {
+        Ok(s) => s,
+        Err(_) => {
+            data::backup_corrupt(&p);
+            Session::default()
         }
     }
+}
+
+fn session_snapshot(app: &AppHandle) -> Session {
+    let mut s = app.state::<SessionState>().0.lock().unwrap().clone();
+    if !app.state::<data::Data>().settings().save_session {
+        s.tabs.clear();
+        s.active = 0;
+    }
+    s
+}
+
+/// Enqueues the in-memory session to the single ordered background writer.
+fn persist(app: &AppHandle) {
+    let Some(path) = session_path(app) else { return };
+    let s = session_snapshot(app);
+    app.state::<data::Data>().write_json(path, s);
+}
+
+/// Enqueues the session and synchronously flushes all pending disk writes on shutdown.
+fn persist_sync(app: &AppHandle) {
+    let data = app.state::<data::Data>();
+    if let Some(path) = session_path(app) {
+        let s = session_snapshot(app);
+        data.write_json(path, s);
+    }
+    data.flush();
 }
 
 /// Remembers the window bounds in memory (the disk write happens on exit).
@@ -449,7 +445,7 @@ fn load_session(webview: tauri::Webview, app: AppHandle) -> Result<Session, Stri
     Ok(app.state::<SessionState>().0.lock().unwrap().clone())
 }
 
-///Deletes the session from persistent storage to prevent unnecessary data retention.
+/// Clears saved open tabs from session storage while preserving tracked window bounds.
 #[tauri::command]
 fn delete_session(
     webview: tauri::Webview,
@@ -457,24 +453,21 @@ fn delete_session(
     state: State<'_, SessionState>,
 ) -> Result<(), String> {
     require_internal(&webview, &["/settings.html"])?;
-    //Lock and completely reset the in-memory runtime session state
-    {
-        let mut session_lock = state.0.lock().map_err(|e| e.to_string())?;
-        *session_lock = Session::default();
+    let snapshot = {
+        let mut s = state.0.lock().map_err(|e| e.to_string())?;
+        s.tabs.clear();
+        s.active = 0;
+        s.clone()
+    };
+    let data = app.state::<data::Data>();
+    if let Some(path) = session_path(&app) {
+        if snapshot.window.is_none() {
+            data.delete_file(path);
+        } else {
+            data.write_json(path, snapshot);
+        }
     }
-
-    //Overwrite the physical session.json file with the empty baseline data.
-    //Must be synchronous: an async write could land after the remove_file below
-    //and resurrect the file this command is supposed to delete.
-    persist_sync(&app);
-
-    //Optional hard-deletion: Clean up the session file completely from the disk
-    if let Some(path) = session_path(&app)
-        && path.exists()
-    {
-        let _ = std::fs::remove_file(path);
-    }
-
+    data.flush();
     Ok(())
 }
 
@@ -653,6 +646,9 @@ fn close_tab(webview: tauri::Webview, app: AppHandle, id: String) -> Result<(), 
 #[tauri::command]
 fn exit_app(webview: tauri::Webview, app: tauri::AppHandle) -> Result<(), String> {
     require_ui(&webview)?;
+    if let Some(w) = app.get_window("main") {
+        track_window(&w);
+    }
     persist_sync(&app);
     app.exit(0);
     Ok(())
@@ -887,8 +883,19 @@ fn history_list(
     app: AppHandle,
     query: String,
 ) -> Result<Vec<data::Entry>, String> {
-    require_internal(&webview, &["/settings.html", "/new.html"])?;
+    require_internal(&webview, &["/settings.html"])?;
     Ok(app.state::<data::Data>().history(&query))
+}
+
+/// Returns up to `limit` distinct recently visited non-search sites for `about:new`.
+#[tauri::command]
+fn recent_sites(
+    webview: tauri::Webview,
+    app: AppHandle,
+    limit: Option<usize>,
+) -> Result<Vec<data::Entry>, String> {
+    require_internal(&webview, &["/new.html"])?;
+    Ok(app.state::<data::Data>().recent_sites(limit.unwrap_or(6)))
 }
 
 ///removes history entry
@@ -973,6 +980,9 @@ async fn open_extension_options(
 #[tauri::command]
 fn restart_app(webview: tauri::Webview, app: AppHandle) -> Result<(), String> {
     require_internal(&webview, &["/extensions.html"])?;
+    if let Some(w) = app.get_window("main") {
+        track_window(&w);
+    }
     persist_sync(&app);
     app.restart();
 }
@@ -1011,6 +1021,7 @@ fn main() {
             open_page,
             history_add,
             history_list,
+            recent_sites,
             history_suggest,
             history_remove,
             history_clear,

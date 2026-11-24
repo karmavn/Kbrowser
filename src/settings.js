@@ -67,6 +67,7 @@ function renderEngines() {
 
 $("#eform").onsubmit = (ev) => {
   ev.preventDefault();
+  if (!settings) return;
   const name = $("#ename").value.trim();
   const url = $("#eurl").value.trim();
   const msg = $("#emsg");
@@ -90,7 +91,16 @@ $("#eform").onsubmit = (ev) => {
   save({ custom_engines: [...(settings.custom_engines ?? []), { id, name, url }] });
 };
 
+function setControlsDisabled(disabled) {
+  for (const el of document.querySelectorAll("#pane-general select, #pane-general input, #pane-general button, #pane-appearance select, #pane-privacy button.switch")) {
+    el.disabled = disabled;
+  }
+}
+setControlsDisabled(true);
+
 function syncControls() {
+  if (!settings) return;
+  setControlsDisabled(false);
   applyTheme();
   renderEngines();
   const set = (el, v) => { if (document.activeElement !== el) el.value = v; };
@@ -103,12 +113,14 @@ function syncControls() {
 }
 
 async function save(patch) {
+  if (!settings) return;
+  const wasSaveSession = settings.save_session;
   settings = { ...settings, ...patch };
   syncControls();
   try { await invoke("set_settings", { settings }); } catch (e) { console.error(e); }
 
-  // Delete session immediately when Save session is turned off to avoid unnecessary storage.
-  if (!settings.save_session) {
+  // Clear saved tabs only when Save session transitions from on -> off.
+  if (wasSaveSession && !settings.save_session) {
     try {
       await invoke("delete_session");
     } catch (err) {
@@ -121,9 +133,9 @@ $("#search").onchange = (e) => save({ search: e.target.value });
 $("#theme").onchange = (e) => save({ theme: e.target.value });
 $("#home").onchange = (e) => save({ home: e.target.value });
 $("#home").onkeydown = (e) => { if (e.key === "Enter") e.target.blur(); };
-$("#savehist").onclick = () => save({ save_history: !settings.save_history });
-$("#savesession").onclick = () => save({ save_session: !settings.save_session });
-$("#showrec").onclick = () => save({ show_suggestions: !settings.show_suggestions });
+$("#savehist").onclick = () => settings && save({ save_history: !settings.save_history });
+$("#savesession").onclick = () => settings && save({ save_session: !settings.save_session });
+$("#showrec").onclick = () => settings && save({ show_suggestions: !settings.show_suggestions });
 
 // ---------- Navigation ----------
 
@@ -143,6 +155,7 @@ for (const b of navItems) b.onclick = () => show(b.dataset.pane);
 
 const timeFormatter = new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" });
 const dayFormatter = new Intl.DateTimeFormat([], { weekday: "long", month: "long", day: "numeric" });
+const dayWithYearFormatter = new Intl.DateTimeFormat([], { weekday: "long", month: "long", day: "numeric", year: "numeric" });
 
 const RM_SVG_NODE = (() => {
   const d = document.createElement("div");
@@ -155,16 +168,17 @@ const RM_SVG_NODE = (() => {
 
 // todayStart is passed in so a 1,000-row render computes "today" once, and each
 // row reuses one Date (setHours) instead of allocating three plus a closure.
-function dayLabel(ms, todayStart) {
+function dayLabel(ms, todayStart, currentYear) {
   const d = new Date(ms);
+  const year = d.getFullYear();
   d.setHours(0, 0, 0, 0);
   const diff = Math.round((todayStart - d.getTime()) / 86400000);
   if (diff === 0) return "Today";
   if (diff === 1) return "Yesterday";
-  return dayFormatter.format(ms);
+  return year === currentYear ? dayFormatter.format(ms) : dayWithYearFormatter.format(ms);
 }
 
-const SEARCH_HOST = /(^|\.)(duckduckgo\.com|google\.[a-z.]+|bing\.com|brave\.com|ecosia\.org)$/;
+const SEARCH_HOST = /^(?:(?:[a-z0-9-]+\.)*(?:duckduckgo\.com|bing\.com|brave\.com|ecosia\.org)|(?:www\.)?google\.(?:[a-z]{2,3}|(?:co|com)\.[a-z]{2,3}))$/i;
 
 // Search result pages are shown as "Search: <query>" so searches are easy to spot.
 function describe(e) {
@@ -223,10 +237,12 @@ async function loadHistory() {
     $hempty.textContent = q.trim() ? "No matching history." : "No browsing history yet.";
 
     const frag = document.createDocumentFragment();
-    const todayStart = new Date().setHours(0, 0, 0, 0);
+    const todayDate = new Date();
+    const currentYear = todayDate.getFullYear();
+    const todayStart = todayDate.setHours(0, 0, 0, 0);
     let lastDay = "";
     for (const e of items) {
-      const day = dayLabel(e.time, todayStart);
+      const day = dayLabel(e.time, todayStart, currentYear);
       if (day !== lastDay) {
         lastDay = day;
         const h = document.createElement("h4");
