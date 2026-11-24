@@ -1,5 +1,5 @@
 ﻿# Performance Measurement Script for Kbrowser
-$ErrorActionPreference = "Continue"
+$ErrorActionPreference = "Stop"
 
 Write-Host "=========================================="
 Write-Host "  Kbrowser Performance Measurement Script "
@@ -33,7 +33,10 @@ $historyTimes = @()
 $fps = @{}
 
 for ($i = 1; $i -le 5; $i++) {
-    $output = & cargo test --manifest-path src-tauri/Cargo.toml -- bench_and_fingerprint --nocapture 2>&1 | Out-String
+    $output = & cargo test --manifest-path src-tauri/Cargo.toml -- bench_and_fingerprint --ignored --nocapture 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        throw "Benchmark run $i failed with exit code $LASTEXITCODE`n$output"
+    }
     
     if ($output -match "SUGGEST_TIME_MICROS:\s+(\d+)") {
         $suggestTimes += [int64]$matches[1]
@@ -54,6 +57,10 @@ for ($i = 1; $i -le 5; $i++) {
         $fps["SETTINGS"] = $matches[1]
     }
     Write-Host "Run $i : Suggest = $($suggestTimes[-1]) µs, History = $($historyTimes[-1]) µs"
+}
+
+if ($suggestTimes.Count -eq 0 -or $historyTimes.Count -eq 0) {
+    throw "No benchmark timings captured."
 }
 
 function Get-Stats($arr) {
