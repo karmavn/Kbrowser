@@ -574,12 +574,6 @@ async fn win_is_maximized(window: Window) -> bool {
     window.is_maximized().unwrap_or(false)
 }
 
-///handles drag action for window movements.
-#[tauri::command]
-async fn win_drag(window: Window) {
-    let _ = window.start_dragging();
-}
-
 ///closes the window.
 #[tauri::command]
 async fn win_close(window: Window) {
@@ -724,7 +718,6 @@ fn main() {
                 let _ = w.set_focus();
             }
         }))
-        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             new_tab,
             activate_tab,
@@ -757,7 +750,6 @@ fn main() {
             win_minimize,
             win_toggle_maximize,
             win_is_maximized,
-            win_drag,
             win_close
         ])
         .setup(|app| {

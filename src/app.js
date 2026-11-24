@@ -499,11 +499,7 @@ window.addEventListener("keydown", (e) => {
   else if (k === "n") { e.preventDefault(); openInternal("about:new"); }
 });
 
-// Custom window frame: drag is handled natively by data-tauri-drag-region, double-click to maximize.
-$("#strip").addEventListener("dblclick", (e) => {
-  if (e.target.closest(".tab, button")) return;
-  invoke("win_toggle_maximize");
-});
+// Custom window frame: drag and double-click maximize are handled natively by data-tauri-drag-region.
 //window controls
 $("#win-min").onclick = () => invoke("win_minimize");
 $winMax.onclick = () => invoke("win_toggle_maximize");

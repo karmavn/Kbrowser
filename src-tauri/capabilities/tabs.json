@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tabs",
+  "description": "Minimal read-only IPC for tab webviews (events and app version only).",
+  "webviews": [
+    "tab-*"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:app:allow-version"
+  ]
+}
