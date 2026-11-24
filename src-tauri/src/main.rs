@@ -8,7 +8,15 @@ mod live;
 mod store;
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use tauri::{
     State, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
     Position, Size, Theme, Url, WebviewUrl, Window, WindowEvent,
@@ -20,6 +28,9 @@ use tauri::{
 const CHROME_H: f64 = 84.0;
 
 struct Ext(Option<PathBuf>);
+
+/// Tracks whether the tab WebView2 environment has already received `extensions_path`.
+struct ExtInit(AtomicBool);
 
 /// IDs of the extensions loaded into the running WebView2 profile.
 struct Loaded(std::sync::Mutex<Vec<String>>);
@@ -69,7 +80,7 @@ fn label(id: &str) -> String {
     format!("tab-{id}")
 }
 
-/// Every webview shares one WebView2 environment, so options must match.
+/// Tab webviews share one WebView2 environment, so extension options are passed on first tab creation.
 fn configure(
     b: WebviewBuilder<tauri::Wry>,
     ext: Option<&PathBuf>,
@@ -82,20 +93,106 @@ fn configure(
     }
 }
 
+fn is_localhost_input(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower == "localhost" || lower.starts_with("localhost:") || lower.starts_with("localhost/")
+}
+
+fn is_valid_bare_host_url(candidate: &str) -> Option<Url> {
+    let u = Url::parse(candidate).ok()?;
+    if !u.username().is_empty() || u.password().is_some() {
+        return None;
+    }
+    let host = u.host_str()?;
+    if host.is_empty()
+        || host == "tauri.localhost"
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || host.contains("..")
+    {
+        return None;
+    }
+    Some(u)
+}
+
+fn allow_tab_navigation(u: &Url, allowed_internal_path: Option<&str>) -> bool {
+    if u.scheme() == "chrome-search" {
+        return false;
+    }
+    if u.host_str() == Some("tauri.localhost") {
+        return allowed_internal_path.is_some_and(|p| u.path() == p);
+    }
+    true
+}
+
+fn allow_popup_url(u: &Url) -> bool {
+    matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| h != "tauri.localhost")
+}
+
+fn allow_open_page_url(raw: &str) -> bool {
+    if matches!(raw, "about:extensions" | "about:settings" | "about:new") {
+        return true;
+    }
+    Url::parse(raw)
+        .ok()
+        .is_some_and(|u| allow_popup_url(&u))
+}
+
+fn is_ui_caller(wv: &tauri::Webview) -> bool {
+    wv.label() == "ui"
+        && wv
+            .url()
+            .ok()
+            .is_some_and(|u| u.host_str() == Some("tauri.localhost"))
+}
+
+fn is_internal_page(wv: &tauri::Webview, allowed_paths: &[&str]) -> bool {
+    wv.label().starts_with("tab-")
+        && wv.url().ok().is_some_and(|u| {
+            u.host_str() == Some("tauri.localhost") && allowed_paths.contains(&u.path())
+        })
+}
+
+fn require_ui(wv: &tauri::Webview) -> Result<(), String> {
+    if is_ui_caller(wv) {
+        Ok(())
+    } else {
+        Err("Unauthorized".into())
+    }
+}
+
+fn require_internal(wv: &tauri::Webview, allowed_paths: &[&str]) -> Result<(), String> {
+    if is_internal_page(wv, allowed_paths) {
+        Ok(())
+    } else {
+        Err("Unauthorized".into())
+    }
+}
+
 //parses different url types
 fn normalize(input: &str, data: &data::Data) -> String {
     let s = input.trim();
+    if s.eq_ignore_ascii_case("about:blank") {
+        return "about:blank".to_string();
+    }
     if let Ok(u) = Url::parse(s)
         && matches!(u.scheme(), "http" | "https" | "file" | "chrome-extension")
+        && u.host_str() != Some("tauri.localhost")
     {
         return s.to_string();
     }
     if !s.contains(char::is_whitespace) {
-        if s.starts_with("localhost") {
-            return format!("http://{s}");
+        if is_localhost_input(s) {
+            let cand = format!("http://{s}");
+            if is_valid_bare_host_url(&cand).is_some() {
+                return cand;
+            }
         }
         if s.contains('.') {
-            return format!("https://{s}");
+            let cand = format!("https://{s}");
+            if is_valid_bare_host_url(&cand).is_some() {
+                return cand;
+            }
         }
     }
     data.search_url(s)
@@ -112,7 +209,10 @@ fn url_from_args(args: &[String], cwd: Option<&Path>) -> Option<String> {
         if let Ok(u) = Url::parse(a)
             && matches!(u.scheme(), "http" | "https" | "file" | "chrome-extension")
         {
-            return Some(u.to_string());
+            if u.host_str() != Some("tauri.localhost") {
+                return Some(u.to_string());
+            }
+            continue;
         }
         // Not a URL: treat it as a file path ("C:\x\a.html" parses as scheme "c", so it lands here).
         let mut p = PathBuf::from(a);
@@ -125,6 +225,18 @@ fn url_from_args(args: &[String], cwd: Option<&Path>) -> Option<String> {
             let s = full.to_string_lossy();
             let clean = PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s));
             if let Ok(u) = Url::from_file_path(&clean) {
+                return Some(u.to_string());
+            }
+        }
+        if !a.contains(char::is_whitespace) {
+            if is_localhost_input(a)
+                && let Some(u) = is_valid_bare_host_url(&format!("http://{a}"))
+            {
+                return Some(u.to_string());
+            }
+            if a.contains('.')
+                && let Some(u) = is_valid_bare_host_url(&format!("https://{a}"))
+            {
                 return Some(u.to_string());
             }
         }
@@ -332,17 +444,23 @@ fn restore_window(window: &Window, ws: &WinState) {
 
 ///loads a session from persistent storage.
 #[tauri::command]
-fn load_session(app: AppHandle) -> Session {
-    app.state::<SessionState>().0.lock().unwrap().clone()
+fn load_session(webview: tauri::Webview, app: AppHandle) -> Result<Session, String> {
+    require_ui(&webview)?;
+    Ok(app.state::<SessionState>().0.lock().unwrap().clone())
 }
 
 ///Deletes the session from persistent storage to prevent unnecessary data retention.
 #[tauri::command]
-fn delete_session(app: AppHandle, state: State<'_, SessionState>) -> Result<(), String> {
+fn delete_session(
+    webview: tauri::Webview,
+    app: AppHandle,
+    state: State<'_, SessionState>,
+) -> Result<(), String> {
+    require_internal(&webview, &["/settings.html"])?;
     //Lock and completely reset the in-memory runtime session state
     {
         let mut session_lock = state.0.lock().map_err(|e| e.to_string())?;
-        *session_lock = Session::default(); 
+        *session_lock = Session::default();
     }
 
     //Overwrite the physical session.json file with the empty baseline data.
@@ -362,7 +480,13 @@ fn delete_session(app: AppHandle, state: State<'_, SessionState>) -> Result<(), 
 
 ///saves the open tabs into persistent storage.
 #[tauri::command]
-fn save_tabs(app: AppHandle, tabs: Vec<String>, active: usize) {
+fn save_tabs(
+    webview: tauri::Webview,
+    app: AppHandle,
+    tabs: Vec<String>,
+    active: usize,
+) -> Result<(), String> {
+    require_ui(&webview)?;
     {
         let st = app.state::<SessionState>();
         let mut s = st.0.lock().unwrap();
@@ -370,28 +494,45 @@ fn save_tabs(app: AppHandle, tabs: Vec<String>, active: usize) {
         s.active = active;
     }
     persist(&app);
+    Ok(())
 }
 
 ///takes the apps launch argument
 #[tauri::command]
-fn take_launch_url(app: AppHandle) -> Option<String> {
-    app.state::<Launch>().0.lock().unwrap().take()
+fn take_launch_url(webview: tauri::Webview, app: AppHandle) -> Result<Option<String>, String> {
+    require_ui(&webview)?;
+    Ok(app.state::<Launch>().0.lock().unwrap().take())
 }
 
 /// creates a new tab. This function handles about: urls seperately, to parse them to their actual
 ///local path. for extension settings, it prevents their redirection to chrome exclusive urls.
 #[tauri::command]
-async fn new_tab(app: AppHandle, id: String, url: String) -> Result<(), String> {
+async fn new_tab(
+    webview: tauri::Webview,
+    app: AppHandle,
+    id: String,
+    url: String,
+) -> Result<(), String> {
+    require_ui(&webview)?;
     let window = app.get_window("main").ok_or("main window missing")?;
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
     let size = window
         .inner_size()
         .map_err(|e| e.to_string())?
         .to_logical::<f64>(scale);
+    let allowed_internal_path: Option<&'static str> = match url.as_str() {
+        "about:extensions" => Some("/extensions.html"),
+        "about:settings" => Some("/settings.html"),
+        "about:new" => Some("/new.html"),
+        _ => None,
+    };
     let target = match url.as_str() {
         "about:extensions" => WebviewUrl::App("extensions.html".into()),
         "about:settings" => WebviewUrl::App("settings.html".into()),
         "about:new" => WebviewUrl::App("new.html".into()),
+        s if s.eq_ignore_ascii_case("about:blank") => {
+            WebviewUrl::External("about:blank".parse::<Url>().map_err(|e| e.to_string())?)
+        }
         _ => {
             let data = app.state::<data::Data>();
             WebviewUrl::External(
@@ -406,12 +547,11 @@ async fn new_tab(app: AppHandle, id: String, url: String) -> Result<(), String> 
     let (a2, i2) = (app.clone(), id.clone());
     let (a3, i3) = (app.clone(), id.clone());
     let a4 = app.clone();
+    let popup_times = std::sync::Arc::new(Mutex::new(VecDeque::<Instant>::new()));
 
     let builder = WebviewBuilder::new(label(&id), target)
         .on_navigation(move |u| {
-            // Some extension pages get bounced to Chrome's built-in new tab page
-            // (chrome-search://local-ntp/...), which doesn't exist in WebView2
-            if u.scheme() == "chrome-search" {
+            if !allow_tab_navigation(u, allowed_internal_path) {
                 return false;
             }
             emit_tab(
@@ -447,15 +587,35 @@ async fn new_tab(app: AppHandle, id: String, url: String) -> Result<(), String> 
                 },
             );
         })
-        // target=_blank and window.open become new tabs.
+        // target=_blank and window.open become new tabs, filtered and rate-limited.
         .on_new_window(move |u, _| {
-            let _ = a4.emit("open-tab", u.to_string());
+            if allow_popup_url(&u) {
+                let now = Instant::now();
+                let mut times = popup_times.lock().unwrap();
+                while times
+                    .front()
+                    .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(1))
+                {
+                    times.pop_front();
+                }
+                if times.len() < 3 {
+                    times.push_back(now);
+                    let _ = a4.emit("open-tab", u.to_string());
+                }
+            }
             NewWindowResponse::Deny
         });
 
+    let first_ext = !app.state::<ExtInit>().0.swap(true, Ordering::AcqRel);
+    let ext_path = if first_ext {
+        app.state::<Ext>().0.clone()
+    } else {
+        None
+    };
+
     window
         .add_child(
-            configure(builder, None),
+            configure(builder, ext_path.as_ref()),
             LogicalPosition::new(0.0, CHROME_H),
             LogicalSize::new(size.width, (size.height - CHROME_H).max(0.0)),
         )
@@ -466,13 +626,21 @@ async fn new_tab(app: AppHandle, id: String, url: String) -> Result<(), String> 
 
 ///shows the given tabs contents.
 #[tauri::command]
-async fn activate_tab(app: AppHandle, id: String, focus: Option<bool>) {
+async fn activate_tab(
+    webview: tauri::Webview,
+    app: AppHandle,
+    id: String,
+    focus: Option<bool>,
+) -> Result<(), String> {
+    require_ui(&webview)?;
     show_only(&app, &id, focus.unwrap_or(true));
+    Ok(())
 }
 
 ///closes a tab.
 #[tauri::command]
-fn close_tab(app: AppHandle, id: String) -> Result<(), String> {
+fn close_tab(webview: tauri::Webview, app: AppHandle, id: String) -> Result<(), String> {
+    require_ui(&webview)?;
     if let Some(wv) = app.get_webview(&label(&id)) {
         wv.close()
             .map_err(|e| format!("Failed to close tab {id}: {e}"))?;
@@ -483,14 +651,22 @@ fn close_tab(app: AppHandle, id: String) -> Result<(), String> {
 
 ///trigers the closing of the app. This happens for example, when the last tab is closed.
 #[tauri::command]
-fn exit_app(app: tauri::AppHandle) {
+fn exit_app(webview: tauri::Webview, app: tauri::AppHandle) -> Result<(), String> {
+    require_ui(&webview)?;
     persist_sync(&app);
     app.exit(0);
+    Ok(())
 }
 
 ///this is the navigation bar.
 #[tauri::command]
-async fn navigate(app: AppHandle, id: String, input: String) -> Result<(), String> {
+async fn navigate(
+    webview: tauri::Webview,
+    app: AppHandle,
+    id: String,
+    input: String,
+) -> Result<(), String> {
+    require_ui(&webview)?;
     let wv = app.get_webview(&label(&id)).ok_or("no such tab")?;
     let url = {
         let data = app.state::<data::Data>();
@@ -509,6 +685,7 @@ async fn navigate_self(
     app: AppHandle,
     input: String,
 ) -> Result<(), String> {
+    require_internal(&webview, &["/new.html"])?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Ok(());
@@ -528,9 +705,14 @@ async fn navigate_self(
 
 /// Forwards keyboard chrome actions from internal pages (`about:new`) to the `ui` webview.
 #[tauri::command]
-async fn ui_action(app: AppHandle, action: String) {
+async fn ui_action(
+    webview: tauri::Webview,
+    app: AppHandle,
+    action: String,
+) -> Result<(), String> {
+    require_internal(&webview, &["/new.html"])?;
     if !matches!(action.as_str(), "new-tab" | "focus-addr" | "open-settings") {
-        return;
+        return Ok(());
     }
     if action == "focus-addr"
         && let Some(ui) = app.get_webview("ui")
@@ -538,11 +720,18 @@ async fn ui_action(app: AppHandle, action: String) {
         let _ = ui.set_focus();
     }
     let _ = app.emit("ui-action", action);
+    Ok(())
 }
 
 ///this is the navbar
 #[tauri::command]
-async fn nav(app: AppHandle, id: String, action: String) -> Result<(), String> {
+async fn nav(
+    webview: tauri::Webview,
+    app: AppHandle,
+    id: String,
+    action: String,
+) -> Result<(), String> {
+    require_ui(&webview)?;
     let wv = app.get_webview(&label(&id)).ok_or("no such tab")?;
     let js = match action.as_str() {
         "back" => "history.back()",
@@ -555,48 +744,66 @@ async fn nav(app: AppHandle, id: String, action: String) -> Result<(), String> {
 
 ///minimizes the current window.
 #[tauri::command]
-async fn win_minimize(window: Window) {
+async fn win_minimize(webview: tauri::Webview, window: Window) -> Result<(), String> {
+    require_ui(&webview)?;
     let _ = window.minimize();
+    Ok(())
 }
 
 #[tauri::command]
-async fn win_toggle_maximize(window: Window) {
+async fn win_toggle_maximize(webview: tauri::Webview, window: Window) -> Result<(), String> {
+    require_ui(&webview)?;
     if window.is_maximized().unwrap_or(false) {
         let _ = window.unmaximize();
     } else {
         let _ = window.maximize();
     }
+    Ok(())
 }
 
 ///returns if the current window is maximized.
 #[tauri::command]
-async fn win_is_maximized(window: Window) -> bool {
-    window.is_maximized().unwrap_or(false)
+async fn win_is_maximized(webview: tauri::Webview, window: Window) -> Result<bool, String> {
+    require_ui(&webview)?;
+    Ok(window.is_maximized().unwrap_or(false))
 }
 
 ///closes the window.
 #[tauri::command]
-async fn win_close(window: Window) {
+async fn win_close(webview: tauri::Webview, window: Window) -> Result<(), String> {
+    require_ui(&webview)?;
     let _ = window.close();
+    Ok(())
 }
 
 ///queries wether the system has "mica", on Windows 11 this checks if transparency is enabled.
 #[tauri::command]
-fn has_mica(app: AppHandle) -> bool {
-    app.state::<Mica>().0
+fn has_mica(webview: tauri::Webview, app: AppHandle) -> Result<bool, String> {
+    require_ui(&webview)?;
+    Ok(app.state::<Mica>().0)
 }
 
 // --- Settings -------------------------------------------------------------------
 
 ///provides settings from the saved settings in settings.json
 #[tauri::command]
-fn get_settings(app: AppHandle) -> data::Settings {
-    app.state::<data::Data>().settings()
+fn get_settings(webview: tauri::Webview, app: AppHandle) -> Result<data::Settings, String> {
+    if !is_ui_caller(&webview)
+        && !is_internal_page(&webview, &["/new.html", "/settings.html", "/extensions.html"])
+    {
+        return Err("Unauthorized".into());
+    }
+    Ok(app.state::<data::Data>().settings())
 }
 
 ///sets new setting/s
 #[tauri::command]
-async fn set_settings(app: AppHandle, settings: data::Settings) -> Result<(), String> {
+async fn set_settings(
+    webview: tauri::Webview,
+    app: AppHandle,
+    settings: data::Settings,
+) -> Result<(), String> {
+    require_internal(&webview, &["/settings.html"])?;
     let saved = app.state::<data::Data>().set_settings(settings);
     if let Some(w) = app.get_window("main") {
         apply_theme(&w, &saved.theme);
@@ -607,99 +814,161 @@ async fn set_settings(app: AppHandle, settings: data::Settings) -> Result<(), St
 
 ///provides the webview version for display in html.
 #[tauri::command]
-fn about_webview() -> String {
-    tauri::webview_version().unwrap_or_else(|_| "unknown".into())
+fn about_webview(webview: tauri::Webview) -> Result<String, String> {
+    require_internal(&webview, &["/settings.html"])?;
+    Ok(tauri::webview_version().unwrap_or_else(|_| "unknown".into()))
 }
 
 /// Opens an internal page or a web address in the browser's tab strip.
 #[tauri::command]
-fn open_page(app: AppHandle, url: String) {
-    if url.starts_with("about:") || url.starts_with("http://") || url.starts_with("https://") {
-        let _ = app.emit("open-tab", url);
+fn open_page(webview: tauri::Webview, app: AppHandle, url: String) -> Result<(), String> {
+    require_internal(&webview, &["/new.html", "/settings.html"])?;
+    if !allow_open_page_url(&url) {
+        return Err("Invalid URL".into());
     }
+    let _ = app.emit("open-tab", url);
+    Ok(())
 }
 
 // --- History --------------------------------------------------------------------
 
 ///adds an entry to the browsing history.
 #[tauri::command]
-fn history_add(app: AppHandle, url: String, title: String) {
+fn history_add(
+    webview: tauri::Webview,
+    app: AppHandle,
+    url: String,
+    title: String,
+) -> Result<(), String> {
+    require_ui(&webview)?;
     if app.state::<data::Data>().add_history(&url, &title) {
         let _ = app.emit("history-updated", ());
     }
+    Ok(())
 }
 
 #[tauri::command]
-fn history_suggest(app: AppHandle, query: String) -> Vec<data::Suggestion> {
-    app.state::<data::Data>().suggest(&query, 6)
+fn history_suggest(
+    webview: tauri::Webview,
+    app: AppHandle,
+    query: String,
+) -> Result<Vec<data::Suggestion>, String> {
+    require_ui(&webview)?;
+    Ok(app.state::<data::Data>().suggest(&query, 6))
 }
 
 /// Grows (or shrinks back) the UI webview for the address-bar suggestion list.
 #[tauri::command]
-async fn set_suggest_height(app: AppHandle, height: f64) {
+async fn set_suggest_height(
+    webview: tauri::Webview,
+    app: AppHandle,
+    height: f64,
+) -> Result<(), String> {
+    require_ui(&webview)?;
     let height = height.clamp(0.0, 400.0);
     {
         let suggest_state = app.state::<Suggest>();
         let mut cur = suggest_state.0.lock().unwrap();
         if (*cur - height).abs() < 1.0 {
-            return; // Height hasn't changed; avoid redundant DWM layout recalculations
+            return Ok(()); // Height hasn't changed; avoid redundant DWM layout recalculations
         }
         *cur = height;
     }
     if let Some(w) = app.get_window("main") {
         layout(&w);
     }
+    Ok(())
 }
 
 ///provides a list of all entries in the browsing history for display in html.
 #[tauri::command]
-fn history_list(app: AppHandle, query: String) -> Vec<data::Entry> {
-    app.state::<data::Data>().history(&query)
+fn history_list(
+    webview: tauri::Webview,
+    app: AppHandle,
+    query: String,
+) -> Result<Vec<data::Entry>, String> {
+    require_internal(&webview, &["/settings.html", "/new.html"])?;
+    Ok(app.state::<data::Data>().history(&query))
 }
 
 ///removes history entry
 #[tauri::command]
-fn history_remove(app: AppHandle, time: u64, url: String) {
+fn history_remove(
+    webview: tauri::Webview,
+    app: AppHandle,
+    time: u64,
+    url: String,
+) -> Result<(), String> {
+    require_internal(&webview, &["/settings.html"])?;
     app.state::<data::Data>().remove(time, &url);
     let _ = app.emit("history-updated", ());
+    Ok(())
 }
 
 ///deletes history within given range.
 #[tauri::command]
-fn history_clear(app: AppHandle, range: String) {
+fn history_clear(
+    webview: tauri::Webview,
+    app: AppHandle,
+    range: String,
+) -> Result<(), String> {
+    require_internal(&webview, &["/settings.html"])?;
     app.state::<data::Data>().clear(&range);
     let _ = app.emit("history-updated", ());
+    Ok(())
 }
 
 // --- Extensions -----------------------------------------------------------------
 
 ///hands the given extension to store.rs for installation handling
 #[tauri::command]
-async fn install_extension(app: AppHandle, input: String) -> Result<store::ExtInfo, String> {
+async fn install_extension(
+    webview: tauri::Webview,
+    app: AppHandle,
+    input: String,
+) -> Result<store::ExtInfo, String> {
+    if !is_ui_caller(&webview) && !is_internal_page(&webview, &["/extensions.html"]) {
+        return Err("Unauthorized".into());
+    }
     store::install(&app, &input).await
 }
 
 ///provides a list of installed extensions for display in html.
 #[tauri::command]
-async fn list_extensions(app: AppHandle) -> Vec<store::ExtInfo> {
-    store::list(&app)
+async fn list_extensions(
+    webview: tauri::Webview,
+    app: AppHandle,
+) -> Result<Vec<store::ExtInfo>, String> {
+    require_internal(&webview, &["/extensions.html", "/settings.html"])?;
+    Ok(store::list(&app))
 }
 
 ///removes extension file.
 #[tauri::command]
-async fn remove_extension(app: AppHandle, id: String) -> Result<(), String> {
+async fn remove_extension(
+    webview: tauri::Webview,
+    app: AppHandle,
+    id: String,
+) -> Result<(), String> {
+    require_internal(&webview, &["/extensions.html"])?;
     store::remove(&app, &id).await
 }
 
 /// Opens the extension's options page (chrome-extension://<id>/<page>) in a new tab.
 #[tauri::command]
-async fn open_extension_options(app: AppHandle, id: String) -> Result<(), String> {
+async fn open_extension_options(
+    webview: tauri::Webview,
+    app: AppHandle,
+    id: String,
+) -> Result<(), String> {
+    require_internal(&webview, &["/extensions.html", "/settings.html"])?;
     let url = store::options_url(&app, &id).await?;
     app.emit("open-tab", url).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn restart_app(app: AppHandle) {
+fn restart_app(webview: tauri::Webview, app: AppHandle) -> Result<(), String> {
+    require_internal(&webview, &["/extensions.html"])?;
     persist_sync(&app);
     app.restart();
 }
@@ -755,6 +1024,10 @@ fn main() {
         .setup(|app| {
             // unpacked Chrome extensions go in <app data dir>/extensions
             let base = app.path().app_data_dir().ok();
+            let ui_profile = base.as_ref().map(|d| d.join("ui-profile"));
+            if let Some(dir) = &ui_profile {
+                let _ = std::fs::create_dir_all(dir);
+            }
             let ext = base.as_ref().map(|d| d.join("extensions"));
             if let Some(dir) = &ext {
                 let _ = std::fs::create_dir_all(dir);
@@ -763,6 +1036,7 @@ fn main() {
             let data = data::Data::load(base);
             let theme = data.settings().theme;
             app.manage(Ext(ext.clone()));
+            app.manage(ExtInit(AtomicBool::new(false)));
             app.manage(Loaded(std::sync::Mutex::new(loaded)));
             app.manage(Suggest(std::sync::Mutex::new(0.0)));
             app.manage(ActiveTab(std::sync::Mutex::new(None)));
@@ -806,12 +1080,14 @@ fn main() {
             let size = window
                 .inner_size()?
                 .to_logical::<f64>(window.scale_factor()?);
+            let mut ui_builder = WebviewBuilder::new("ui", WebviewUrl::App("index.html".into()))
+                .transparent(true)
+                .browser_extensions_enabled(false);
+            if let Some(dir) = ui_profile {
+                ui_builder = ui_builder.data_directory(dir);
+            }
             window.add_child(
-                configure(
-                    WebviewBuilder::new("ui", WebviewUrl::App("index.html".into()))
-                        .transparent(true),
-                    ext.as_ref(),
-                ),
+                ui_builder,
                 LogicalPosition::new(0.0, 0.0),
                 LogicalSize::new(size.width, CHROME_H),
             )?;
@@ -846,9 +1122,17 @@ mod tests {
         let data = data::Data::load(None);
         assert_eq!(normalize("https://example.com", &data), "https://example.com");
         assert_eq!(normalize("http://example.com/foo", &data), "http://example.com/foo");
+        assert_eq!(normalize("about:blank", &data), "about:blank");
+        assert_eq!(normalize("ABOUT:BLANK", &data), "about:blank");
+        assert_eq!(normalize("localhost", &data), "http://localhost");
         assert_eq!(normalize("localhost:3000", &data), "http://localhost:3000");
+        assert_eq!(normalize("localhost/foo", &data), "http://localhost/foo");
+        assert_eq!(normalize("localhost.com", &data), "https://localhost.com");
         assert_eq!(normalize("github.com", &data), "https://github.com");
         assert_eq!(normalize("what is rust", &data), "https://duckduckgo.com/?q=what+is+rust");
+        assert_eq!(normalize("...", &data), "https://duckduckgo.com/?q=...");
+        assert_eq!(normalize(".env", &data), "https://duckduckgo.com/?q=.env");
+        assert_eq!(normalize("foo..bar", &data), "https://duckduckgo.com/?q=foo..bar");
     }
 
     #[test]
@@ -865,6 +1149,59 @@ mod tests {
             "https://crates.io".into(),
         ];
         assert_eq!(url_from_args(&args_flag, None), Some("https://crates.io/".into()));
+
+        let args_bare = vec!["kbrowser.exe".into(), "example.com".into()];
+        assert_eq!(
+            url_from_args(&args_bare, None),
+            Some("https://example.com/".into())
+        );
+
+        let args_local = vec!["kbrowser.exe".into(), "localhost:3000".into()];
+        assert_eq!(
+            url_from_args(&args_local, None),
+            Some("http://localhost:3000/".into())
+        );
+
+        let args_bad = vec![
+            "kbrowser.exe".into(),
+            "http://tauri.localhost/index.html".into(),
+            "javascript:alert(1)".into(),
+        ];
+        assert_eq!(url_from_args(&args_bad, None), None);
+    }
+
+    #[test]
+    fn test_navigation_and_popup_policy() {
+        let chrome_search = Url::parse("chrome-search://local-ntp/").unwrap();
+        assert!(!allow_tab_navigation(&chrome_search, None));
+
+        let ui_url = Url::parse("http://tauri.localhost/index.html").unwrap();
+        assert!(!allow_tab_navigation(&ui_url, None));
+        assert!(!allow_tab_navigation(&ui_url, Some("/settings.html")));
+
+        let settings_url = Url::parse("http://tauri.localhost/settings.html").unwrap();
+        assert!(!allow_tab_navigation(&settings_url, None));
+        assert!(!allow_tab_navigation(&settings_url, Some("/new.html")));
+        assert!(allow_tab_navigation(&settings_url, Some("/settings.html")));
+
+        let https_url = Url::parse("https://example.com/").unwrap();
+        assert!(allow_tab_navigation(&https_url, None));
+        assert!(allow_popup_url(&https_url));
+
+        assert!(!allow_popup_url(&ui_url));
+        assert!(!allow_popup_url(&settings_url));
+        assert!(!allow_popup_url(&Url::parse("file:///C:/Windows/win.ini").unwrap()));
+        assert!(!allow_popup_url(&Url::parse("chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/opt.html").unwrap()));
+        assert!(!allow_popup_url(&Url::parse("about:extensions").unwrap()));
+        assert!(!allow_popup_url(&Url::parse("javascript:alert(1)").unwrap()));
+
+        assert!(allow_open_page_url("about:settings"));
+        assert!(allow_open_page_url("about:extensions"));
+        assert!(allow_open_page_url("about:new"));
+        assert!(allow_open_page_url("https://chromewebstore.google.com/"));
+        assert!(!allow_open_page_url("about:blank"));
+        assert!(!allow_open_page_url("http://tauri.localhost/index.html"));
+        assert!(!allow_open_page_url("file:///C:/Windows/win.ini"));
     }
 }
 

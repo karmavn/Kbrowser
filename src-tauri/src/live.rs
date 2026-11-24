@@ -35,9 +35,15 @@ where
     T: Send + 'static,
     F: FnOnce(ICoreWebView2Profile7, Reply<T>) + Send + 'static,
 {
-    let ui = app.get_webview("ui").ok_or("UI webview missing")?;
+    // Target a tab webview rather than "ui", since "ui" is isolated in its own profile without extensions.
+    let tab = app
+        .webviews()
+        .into_iter()
+        .find(|(name, _)| name.starts_with("tab-"))
+        .map(|(_, wv)| wv)
+        .ok_or("No active tab webview available")?;
     let (tx, rx) = oneshot::channel();
-    ui.with_webview(move |pw| {
+    tab.with_webview(move |pw| {
         let reply: Reply<T> = Rc::new(RefCell::new(Some(tx)));
         match profile(&pw) {
             Ok(p) => f(p, reply),
