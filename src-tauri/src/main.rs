@@ -930,7 +930,9 @@ async fn install_extension(
     if !is_ui_caller(&webview) && !is_internal_page(&webview, &["/extensions.html"]) {
         return Err("Unauthorized".into());
     }
-    store::install(&app, &input).await
+    let ext = store::install(&app, &input).await?;
+    let _ = app.emit("extensions-changed", ());
+    Ok(ext)
 }
 
 ///provides a list of installed extensions for display in html.
@@ -940,7 +942,7 @@ async fn list_extensions(
     app: AppHandle,
 ) -> Result<Vec<store::ExtInfo>, String> {
     require_internal(&webview, &["/extensions.html", "/settings.html"])?;
-    Ok(store::list(&app))
+    Ok(store::list(&app).await)
 }
 
 ///removes extension file.
@@ -951,7 +953,9 @@ async fn remove_extension(
     id: String,
 ) -> Result<(), String> {
     require_internal(&webview, &["/extensions.html"])?;
-    store::remove(&app, &id).await
+    store::remove(&app, &id).await?;
+    let _ = app.emit("extensions-changed", ());
+    Ok(())
 }
 
 /// Opens the extension's options page (chrome-extension://<id>/<page>) in a new tab.

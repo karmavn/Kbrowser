@@ -59,13 +59,24 @@ where
 }
 
 /// Loads the unpacked extension in `dir` into the running profile.
-pub async fn add(app: &AppHandle, dir: &Path) -> Result<(), String> {
-    let path = HSTRING::from(dir.to_string_lossy().as_ref());
+/// Returns the extension ID assigned by WebView2 (or empty string if unavailable).
+pub async fn add(app: &AppHandle, dir: &Path) -> Result<String, String> {
+    let path = HSTRING::from(dir.as_os_str());
     on_profile(app, move |profile, reply| {
         let done = reply.clone();
         let handler =
-            ProfileAddBrowserExtensionCompletedHandler::create(Box::new(move |res, _ext| {
-                finish(&done, res.map_err(|e| e.to_string()));
+            ProfileAddBrowserExtensionCompletedHandler::create(Box::new(move |res, ext| {
+                let outcome = (|| -> windows::core::Result<String> {
+                    res?;
+                    if let Some(ext) = ext {
+                        let mut raw = PWSTR::null();
+                        unsafe { ext.Id(&mut raw)? };
+                        Ok(take_pwstr(raw))
+                    } else {
+                        Ok(String::new())
+                    }
+                })();
+                finish(&done, outcome.map_err(|e| e.to_string()));
                 Ok(())
             }));
         if let Err(e) = unsafe { profile.AddBrowserExtension(&path, &handler) } {
@@ -75,8 +86,12 @@ pub async fn add(app: &AppHandle, dir: &Path) -> Result<(), String> {
     .await
 }
 
-/// Removes the extension with this ID from the running profile (no-op if not loaded).
-pub async fn remove(app: &AppHandle, id: &str) -> Result<(), String> {
+/// Removes the extension matching `id` (or any fallback manifest name) from the running profile.
+pub async fn remove(
+    app: &AppHandle,
+    id: &str,
+    fallback_names: Vec<String>,
+) -> Result<(), String> {
     let id = id.to_string();
     on_profile(app, move |profile, reply| {
         let r = reply.clone();
@@ -93,9 +108,17 @@ pub async fn remove(app: &AppHandle, id: &str) -> Result<(), String> {
                     unsafe { list.Count(&mut count)? };
                     for i in 0..count {
                         let ext = unsafe { list.GetValueAtIndex(i)? };
-                        let mut raw = PWSTR::null();
-                        unsafe { ext.Id(&mut raw)? };
-                        if take_pwstr(raw) == id {
+                        let mut raw_id = PWSTR::null();
+                        unsafe { ext.Id(&mut raw_id)? };
+                        let ext_id = take_pwstr(raw_id);
+                        let mut matches = ext_id == id;
+                        if !matches && !fallback_names.is_empty() {
+                            let mut raw_name = PWSTR::null();
+                            unsafe { ext.Name(&mut raw_name)? };
+                            let ext_name = take_pwstr(raw_name);
+                            matches = fallback_names.iter().any(|n| n == &ext_name);
+                        }
+                        if matches {
                             let done = r.clone();
                             let rm = BrowserExtensionRemoveCompletedHandler::create(Box::new(
                                 move |res| {
@@ -140,11 +163,13 @@ pub async fn list(app: &AppHandle) -> Result<Vec<(String, String)>, String> {
                     let mut out = vec![];
                     for i in 0..count {
                         let ext = unsafe { list.GetValueAtIndex(i)? };
-                        let mut id = PWSTR::null();
-                        unsafe { ext.Id(&mut id)? };
-                        let mut name = PWSTR::null();
-                        unsafe { ext.Name(&mut name)? };
-                        out.push((take_pwstr(id), take_pwstr(name)));
+                        let mut raw_id = PWSTR::null();
+                        unsafe { ext.Id(&mut raw_id)? };
+                        let id = take_pwstr(raw_id);
+                        let mut raw_name = PWSTR::null();
+                        unsafe { ext.Name(&mut raw_name)? };
+                        let name = take_pwstr(raw_name);
+                        out.push((id, name));
                     }
                     Ok(out)
                 })();

@@ -334,6 +334,9 @@ $("#manage").onclick = () => invoke("open_page", { url: "about:extensions" });
 // ---------- Events + startup ----------
 
 listen("settings-changed", ({ payload }) => { settings = payload; syncControls(); });
+listen("extensions-changed", () => {
+  if (!$("#pane-extensions").hidden) loadExts();
+});
 // Debounced: a burst of history-updated events (e.g. several tabs finishing loads,
 // or the echo of our own optimistic removal) coalesces into one list rebuild.
 let historyReloadTimer;

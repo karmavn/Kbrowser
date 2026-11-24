@@ -339,7 +339,7 @@ $add.onclick = async () => {
   $add.textContent = "Adding…";
   try {
     await invoke("install_extension", { input: id });
-    openTab("about:extensions"); // shows the restart prompt
+    openInternal("about:extensions"); // shows the restart prompt or newly loaded extension
   } catch (e) {
     $add.textContent = "Couldn’t add";
     $add.title = String(e);

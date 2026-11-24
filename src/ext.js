@@ -46,8 +46,10 @@ function renderList(exts) {
       ? "This extension has no settings page"
       : !e.active ? "Restart the browser to start this extension" : "";
     opts.onclick = async () => {
+      opts.disabled = true;
       try { await invoke("open_extension_options", { id: e.id }); }
       catch (err) { setMsg(String(err), "msg-error"); }
+      finally { opts.disabled = false; }
     };
 
     const rm = document.createElement("button");
@@ -111,8 +113,9 @@ $("#addform").onsubmit = async (ev) => {
   load();
 };
 
-$("#restart").onclick = () => invoke("restart_app");
+$("#restart").onclick = () => invoke("restart_app").catch((err) => setMsg(String(err), "msg-error"));
 listen("settings-changed", ({ payload }) => applyTheme(payload?.theme));
+listen("extensions-changed", () => load());
 
 (async () => {
   const list = $("#list");
