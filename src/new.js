@@ -84,7 +84,7 @@ $("#open-settings").onclick = () => invoke("open_page", { url: "about:settings" 
 $("#open-extensions").onclick = () => invoke("open_page", { url: "about:extensions" });
 
 window.addEventListener("keydown", (e) => {
-  if (!e.ctrlKey || e.altKey) return;
+  if (!e.ctrlKey || e.altKey || e.shiftKey) return;
   const k = e.key.toLowerCase();
   if (k === "t") { e.preventDefault(); invoke("ui_action", { action: "new-tab" }); }
   else if (k === "l") { e.preventDefault(); invoke("ui_action", { action: "focus-addr" }); }

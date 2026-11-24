@@ -4,15 +4,24 @@
 
 use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
-use tauri::{AppHandle, Manager, webview::PlatformWebview};
+use tauri::{AppHandle, Emitter, Manager, webview::PlatformWebview};
 use tokio::sync::oneshot;
 use webview2_com::{
-    BrowserExtensionRemoveCompletedHandler,
-    Microsoft::Web::WebView2::Win32::{ICoreWebView2_13, ICoreWebView2Profile7},
+    AcceleratorKeyPressedEventHandler, BrowserExtensionRemoveCompletedHandler,
+    Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
+        COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, ICoreWebView2_13, ICoreWebView2Profile7,
+    },
     ProfileAddBrowserExtensionCompletedHandler, ProfileGetBrowserExtensionsCompletedHandler,
-    take_pwstr,
+    SourceChangedEventHandler, take_pwstr,
 };
-use windows::core::{HSTRING, Interface, PWSTR};
+use windows::{
+    Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyState, VK_CONTROL, VK_F5, VK_L, VK_LEFT, VK_MENU, VK_N, VK_OEM_COMMA, VK_R,
+        VK_RIGHT, VK_SHIFT, VK_T, VK_TAB, VK_W,
+    },
+    core::{HSTRING, Interface, PWSTR},
+};
 
 /// One-shot reply slot, shared between the call site and the COM completion handler.
 type Reply<T> = Rc<RefCell<Option<oneshot::Sender<Result<T, String>>>>>;
@@ -181,4 +190,133 @@ pub async fn list(app: &AppHandle) -> Result<Vec<(String, String)>, String> {
         }
     })
     .await
+}
+
+pub(crate) fn map_accelerator(vk: u32, ctrl: bool, alt: bool, shift: bool) -> Option<&'static str> {
+    if vk == VK_F5.0 as u32 && !ctrl && !alt && !shift {
+        return Some("reload");
+    }
+    if alt && !ctrl && !shift {
+        if vk == VK_LEFT.0 as u32 {
+            return Some("back");
+        }
+        if vk == VK_RIGHT.0 as u32 {
+            return Some("forward");
+        }
+    }
+    if ctrl && !alt {
+        if vk == VK_TAB.0 as u32 {
+            return Some(if shift { "prev-tab" } else { "next-tab" });
+        }
+        if !shift {
+            if vk == VK_T.0 as u32 || vk == VK_N.0 as u32 {
+                return Some("new-tab");
+            }
+            if vk == VK_W.0 as u32 {
+                return Some("close-tab");
+            }
+            if vk == VK_L.0 as u32 {
+                return Some("focus-addr");
+            }
+            if vk == VK_R.0 as u32 {
+                return Some("reload");
+            }
+            if vk == VK_OEM_COMMA.0 as u32 {
+                return Some("open-settings");
+            }
+        }
+    }
+    None
+}
+
+/// Hooks `SourceChanged` (SPA pushState URL updates) and `AcceleratorKeyPressed`
+/// (global browser shortcuts while page content has focus) onto a tab webview.
+pub fn attach_tab_hooks(wv: &tauri::Webview, app: AppHandle, id: String) {
+    let _ = wv.with_webview(move |pw| {
+        let controller = pw.controller();
+        if let Ok(core) = unsafe { controller.CoreWebView2() } {
+            let (a_src, id_src) = (app.clone(), id.clone());
+            let src_handler = SourceChangedEventHandler::create(Box::new(move |sender, _| {
+                if let Some(wv) = sender {
+                    let mut raw = PWSTR::null();
+                    if unsafe { wv.Source(&mut raw) }.is_ok() {
+                        let url = take_pwstr(raw);
+                        if !url.is_empty() && !url.starts_with("chrome-search://") {
+                            crate::emit_tab(
+                                &a_src,
+                                crate::TabUpdate {
+                                    id: id_src.clone(),
+                                    url: Some(url),
+                                    title: None,
+                                    loading: None,
+                                },
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }));
+            let mut src_tok = 0i64;
+            let _ = unsafe { core.add_SourceChanged(&src_handler, &mut src_tok) };
+        }
+
+        let key_handler = AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {
+            if let Some(args) = args {
+                let mut kind = COREWEBVIEW2_KEY_EVENT_KIND::default();
+                if unsafe { args.KeyEventKind(&mut kind) }.is_ok()
+                    && (kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                        || kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN)
+                {
+                    let mut vk = 0u32;
+                    if unsafe { args.VirtualKey(&mut vk) }.is_ok() {
+                        let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+                        let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
+                        let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                        if let Some(action) = map_accelerator(vk, ctrl, alt, shift) {
+                            let _ = unsafe { args.SetHandled(true) };
+                            if action == "focus-addr"
+                                && let Some(ui) = app.get_webview("ui")
+                            {
+                                let _ = ui.set_focus();
+                            }
+                            let _ = app.emit("ui-action", action);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }));
+        let mut key_tok = 0i64;
+        let _ = unsafe { controller.add_AcceleratorKeyPressed(&key_handler, &mut key_tok) };
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VK_F5, VK_L, VK_LEFT, VK_N, VK_OEM_COMMA, VK_R, VK_RIGHT, VK_T, VK_TAB, VK_W,
+    };
+
+    #[test]
+    fn test_map_accelerator() {
+        assert_eq!(map_accelerator(VK_F5.0 as u32, false, false, false), Some("reload"));
+        assert_eq!(map_accelerator(VK_LEFT.0 as u32, false, true, false), Some("back"));
+        assert_eq!(map_accelerator(VK_RIGHT.0 as u32, false, true, false), Some("forward"));
+        assert_eq!(map_accelerator(VK_T.0 as u32, true, false, false), Some("new-tab"));
+        assert_eq!(map_accelerator(VK_W.0 as u32, true, false, false), Some("close-tab"));
+        assert_eq!(map_accelerator(VK_L.0 as u32, true, false, false), Some("focus-addr"));
+        assert_eq!(map_accelerator(VK_R.0 as u32, true, false, false), Some("reload"));
+        assert_eq!(map_accelerator(VK_OEM_COMMA.0 as u32, true, false, false), Some("open-settings"));
+        assert_eq!(map_accelerator(VK_N.0 as u32, true, false, false), Some("new-tab"));
+        assert_eq!(map_accelerator(VK_TAB.0 as u32, true, false, false), Some("next-tab"));
+        assert_eq!(map_accelerator(VK_TAB.0 as u32, true, false, true), Some("prev-tab"));
+
+        // Shift or DevTools or plain keys must not be hijacked
+        assert_eq!(map_accelerator(0x49, true, false, true), None); // Ctrl+Shift+I
+        assert_eq!(map_accelerator(VK_T.0 as u32, true, false, true), None);
+        assert_eq!(map_accelerator(VK_R.0 as u32, true, false, true), None);
+        assert_eq!(map_accelerator(VK_L.0 as u32, true, false, true), None);
+        assert_eq!(map_accelerator(VK_T.0 as u32, false, false, false), None);
+    }
 }

@@ -36,14 +36,34 @@ function applyTheme() {
   else delete document.documentElement.dataset.theme;
 }
 
-// Web Store detail pages look like /detail/<slug>/<32-letter id>
-const storeId = (url) =>
-  /^https:\/\/chromewebstore\.google\.com\/detail\/[^/]+\/([a-p]{32})/.exec(url ?? "")?.[1] ?? null;
+// Web Store detail pages contain a 32-letter [a-p] extension ID path segment
+const storeId = (url) => {
+  try {
+    const u = new URL(url ?? "");
+    if (u.hostname !== "chromewebstore.google.com" && u.hostname !== "chrome.google.com") return null;
+    return u.pathname.split("/").find((s) => /^[a-p]{32}$/.test(s)) ?? null;
+  } catch {
+    return null;
+  }
+};
 // Our own pages are served from tauri.localhost; show a friendly address.
 const shown = (url) => {
   const m = /^https?:\/\/tauri\.localhost\/(extensions|settings|new)\.html/.exec(url ?? "");
   return m ? `about:${m[1]}` : url ?? "";
 };
+
+function fallbackTitle(url) {
+  const s = shown(url);
+  if (s === "about:new") return "New tab";
+  if (s === "about:settings") return "Settings";
+  if (s === "about:extensions") return "Extensions";
+  try {
+    const u = new URL(url);
+    return u.hostname || s || "New tab";
+  } catch {
+    return s || "New tab";
+  }
+}
 
 const tabs = new Map(); // id -> { title, url, loading }
 let active = null;
@@ -59,19 +79,31 @@ async function openTab(url = settings.home) {
   const id = "t" + ++seq;
   const isExtensionPage = /^chrome-extension:\/\//i.test(url);
 
-  tabs.set(id, { title: "New tab", url, loading: true });
+  if (document.activeElement === $addr) $addr.blur();
+  tabs.set(id, { title: fallbackTitle(url), url, loading: true });
   active = id;
   render();
+  scrollActiveTab();
 
   try {
     // Let the native webview initialize and load its extensions first.
     await invoke("new_tab", {
       id,
       url: isExtensionPage ? "about:blank" : url,
+      activate: active === id,
     });
+
+    if (!tabs.has(id)) {
+      invoke("close_tab", { id }).catch(() => {});
+      return;
+    }
+    if (active !== id && active) {
+      invoke("activate_tab", { id: active }).catch(() => {});
+    }
 
     // Navigate to the extension page after creation is complete.
     if (isExtensionPage) {
+      if (!tabs.has(id)) return;
       await invoke("navigate", { id, input: url });
     }
   } catch (e) {
@@ -91,10 +123,24 @@ function openInternal(url) {
   found ? activate(found[0]) : openTab(url);
 }
 
+function scrollActiveTab() {
+  const el = $tabs.querySelector(`.tab[data-id="${active}"]`);
+  el?.scrollIntoView({ inline: "nearest", block: "nearest" });
+}
+
+$tabs.addEventListener("wheel", (e) => {
+  if (e.deltaY && !e.deltaX) {
+    $tabs.scrollLeft += e.deltaY;
+    e.preventDefault();
+  }
+}, { passive: false });
+
 function activate(id) {
+  if (document.activeElement === $addr) $addr.blur();
   active = id;
   render();
-  invoke("activate_tab", { id });
+  scrollActiveTab();
+  invoke("activate_tab", { id }).catch(() => {});
 }
 
 function cycleTab(dir) {
@@ -146,6 +192,7 @@ async function closeTab(id, { keepFocus = false } = {}) {
   const nextFocusId = remaining[Math.min(idx, remaining.length - 1)] ?? null;
 
   if (wasActive) {
+    if (document.activeElement === $addr) $addr.blur();
     active = nextFocusId;
   }
 
@@ -201,6 +248,7 @@ function render() {
 
   if (sameIds) {
     // Fast path: update attributes and text in place without destroying DOM elements
+    const tabsFocused = $tabs.contains(document.activeElement);
     for (let i = 0; i < currentEls.length; i++) {
       const el = currentEls[i];
       const id = targetIds[i];
@@ -210,11 +258,13 @@ function render() {
       if (el.className !== expectedClass) el.className = expectedClass;
       const selected = isActive ? "true" : "false";
       if (el.getAttribute("aria-selected") !== selected) el.setAttribute("aria-selected", selected);
-      const ti = isActive ? "0" : "-1";
-      if (el.getAttribute("tabindex") !== ti) el.setAttribute("tabindex", ti);
+      if (!tabsFocused) {
+        const ti = isActive ? "0" : "-1";
+        if (el.getAttribute("tabindex") !== ti) el.setAttribute("tabindex", ti);
+      }
       if (el.title !== t.title) {
         el.title = t.title;
-        const titleSpan = el.children[1];
+        const titleSpan = el.querySelector(".title");
         if (titleSpan && titleSpan.textContent !== t.title) titleSpan.textContent = t.title;
       }
     }
@@ -282,7 +332,7 @@ function record(t) {
   let u;
   try { u = new URL(t.url); } catch { return; }
   if (!/^https?:$/.test(u.protocol) || u.hostname === "tauri.localhost") return;
-  invoke("history_add", { url: t.url, title: t.title === "New tab" ? "" : t.title });
+  invoke("history_add", { url: t.url, title: t.title === "New tab" ? "" : t.title }).catch(() => {});
 }
 
 listen("tab-updated", ({ payload: p }) => {
@@ -290,20 +340,21 @@ listen("tab-updated", ({ payload: p }) => {
   if (!t) return;
   // Safety net: if a bounce to Chrome's new tab page slips past the backend, step back once.
   if (p.url?.startsWith("chrome-search://")) {
-    if (!t.bounced) { t.bounced = true; invoke("nav", { id: p.id, action: "back" }); }
+    if (!t.bounced) { t.bounced = true; invoke("nav", { id: p.id, action: "back" }).catch(() => {}); }
     return;
   }
   let changed = false;
   if (p.url != null && p.url !== t.url) {
     t.url = p.url;
+    t.title = fallbackTitle(p.url);
     changed = true;
-    if (t.title === "New tab") {
-      try { t.title = new URL(p.url).hostname; } catch {}
-    }
   }
-  if (p.title != null && p.title !== t.title) {
-    t.title = p.title;
-    changed = true;
+  if (p.title != null) {
+    const clean = p.title.trim();
+    if (clean && clean !== t.title) {
+      t.title = clean;
+      changed = true;
+    }
   }
   if (p.loading != null && p.loading !== t.loading) {
     t.loading = p.loading;
@@ -330,11 +381,17 @@ listen("settings-changed", ({ payload }) => {
 });
 listen("ui-action", ({ payload }) => {
   if (payload === "new-tab") openTab();
+  else if (payload === "close-tab") active && closeTab(active);
   else if (payload === "focus-addr") $addr.focus();
+  else if (payload === "reload") nav("reload");
+  else if (payload === "back") nav("back");
+  else if (payload === "forward") nav("forward");
+  else if (payload === "next-tab") cycleTab(1);
+  else if (payload === "prev-tab") cycleTab(-1);
   else if (payload === "open-settings") openInternal("about:settings");
 });
 
-const nav = (action) => active && invoke("nav", { id: active, action });
+const nav = (action) => active && invoke("nav", { id: active, action }).catch(() => {});
 $("#back").onclick = () => nav("back");
 $("#fwd").onclick = () => nav("forward");
 $("#reload").onclick = () => nav("reload");
@@ -381,7 +438,7 @@ function closeSuggest() {
   $suggest.hidden = true;
   if (currentSuggestH !== 0) {
     currentSuggestH = 0;
-    invoke("set_suggest_height", { height: 0 });
+    invoke("set_suggest_height", { height: 0 }).catch(() => {});
   }
 }
 
@@ -440,7 +497,7 @@ function paintSuggest() {
 function pick(r) {
   $addr.value = r.url;
   closeSuggest();
-  if (active) invoke("navigate", { id: active, input: r.url });
+  if (active) invoke("navigate", { id: active, input: r.url }).catch(() => {});
   $addr.blur();
 }
 
@@ -464,7 +521,7 @@ async function updateSuggest() {
   const targetH = rows.length * ROW_H + PAD;
   if (currentSuggestH !== targetH) {
     currentSuggestH = targetH;
-    invoke("set_suggest_height", { height: targetH });
+    invoke("set_suggest_height", { height: targetH }).catch(() => {});
   }
 }
 
@@ -484,7 +541,7 @@ $addr.onkeydown = (e) => {
     const v = $addr.value.trim();
     closeSuggest();
     if (INTERNAL.has(v)) openInternal(v);
-    else invoke("navigate", { id: active, input: $addr.value });
+    else invoke("navigate", { id: active, input: $addr.value }).catch(() => {});
     $addr.blur();
   } else if (e.key === "Escape") {
     closeSuggest();
@@ -493,31 +550,32 @@ $addr.onkeydown = (e) => {
   }
 };
 
-// Shortcuts work while the toolbar has focus; page focus needs native handling.
+// Shortcuts work while the toolbar has focus; page focus is handled natively via AcceleratorKeyPressed.
 window.addEventListener("keydown", (e) => {
-  if (e.key === "F5") { e.preventDefault(); nav("reload"); return; }
-  if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); nav("back"); return; }
-  if (e.altKey && e.key === "ArrowRight") { e.preventDefault(); nav("forward"); return; }
+  if (e.key === "F5" && !e.ctrlKey && !e.altKey && !e.shiftKey) { e.preventDefault(); nav("reload"); return; }
+  if (e.altKey && !e.ctrlKey && !e.shiftKey && e.key === "ArrowLeft") { e.preventDefault(); nav("back"); return; }
+  if (e.altKey && !e.ctrlKey && !e.shiftKey && e.key === "ArrowRight") { e.preventDefault(); nav("forward"); return; }
   if (!e.ctrlKey || e.altKey) return;
   if (e.key === "Tab") { e.preventDefault(); cycleTab(e.shiftKey ? -1 : 1); return; }
+  if (e.shiftKey) return;
   const k = e.key.toLowerCase();
   if (k === "t") { e.preventDefault(); openTab(); }
   else if (k === "w") { e.preventDefault(); active && closeTab(active); }
   else if (k === "l") { e.preventDefault(); $addr.focus(); }
   else if (k === "r") { e.preventDefault(); nav("reload"); }
   else if (k === ",") { e.preventDefault(); openInternal("about:settings"); }
-  else if (k === "n") { e.preventDefault(); openInternal("about:new"); }
+  else if (k === "n") { e.preventDefault(); openTab("about:new"); }
 });
 
 // Custom window frame: drag and double-click maximize are handled natively by data-tauri-drag-region.
 //window controls
-$("#win-min").onclick = () => invoke("win_minimize");
-$winMax.onclick = () => invoke("win_toggle_maximize");
-$("#win-close").onclick = () => invoke("win_close");
+$("#win-min").onclick = () => invoke("win_minimize").catch(() => {});
+$winMax.onclick = () => invoke("win_toggle_maximize").catch(() => {});
+$("#win-close").onclick = () => invoke("win_close").catch(() => {});
 let lastMax = null;
 async function syncMax() {
-  const max = await invoke("win_is_maximized");
-  if (max === lastMax) return; // unchanged: skip the DOM write on every resize tick
+  const max = await invoke("win_is_maximized").catch(() => null);
+  if (max === null || max === lastMax) return; // unchanged: skip the DOM write on every resize tick
   lastMax = max;
   $winMax.replaceChildren((max ? RESTORE_ICON_NODE : MAX_ICON_NODE).cloneNode(true));
   $winMax.title = max ? "Restore" : "Maximize";

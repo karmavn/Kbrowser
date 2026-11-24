@@ -69,11 +69,11 @@ struct Session {
 struct SessionState(std::sync::Mutex<Session>);
 
 #[derive(Clone, Serialize)]
-struct TabUpdate {
-    id: String,
-    url: Option<String>,
-    title: Option<String>,
-    loading: Option<bool>,
+pub(crate) struct TabUpdate {
+    pub(crate) id: String,
+    pub(crate) url: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) loading: Option<bool>,
 }
 
 fn label(id: &str) -> String {
@@ -257,6 +257,9 @@ fn layout(window: &Window) {
     let (Ok(scale), Ok(px)) = (window.scale_factor(), window.inner_size()) else {
         return;
     };
+    if px.width == 0 || px.height == 0 {
+        return;
+    }
     let size = px.to_logical::<f64>(scale);
     let content_h = (size.height - CHROME_H).max(0.0);
     let extra = *window.app_handle().state::<Suggest>().0.lock().unwrap();
@@ -331,7 +334,7 @@ fn show_only(app: &AppHandle, id: &str, focus_content: bool) {
     }
 }
 
-fn emit_tab(app: &AppHandle, update: TabUpdate) {
+pub(crate) fn emit_tab(app: &AppHandle, update: TabUpdate) {
     let _ = app.emit("tab-updated", update);
 }
 
@@ -409,6 +412,16 @@ fn track_window(window: &Window) {
     }
 }
 
+fn rect_on_monitor(ws: &WinState, mon_x: i32, mon_y: i32, mon_w: u32, mon_h: u32) -> bool {
+    let half_w = i32::try_from(ws.width / 2).unwrap_or(i32::MAX);
+    let cx = ws.x.saturating_add(half_w);
+    let right = mon_x.saturating_add(i32::try_from(mon_w).unwrap_or(i32::MAX));
+    let bottom = mon_y
+        .saturating_add(i32::try_from(mon_h).unwrap_or(i32::MAX))
+        .saturating_sub(50);
+    cx >= mon_x && cx < right && ws.y >= mon_y && ws.y < bottom
+}
+
 /// True if the window's top edge is still reachable on one of the connected monitors.
 fn on_screen(window: &Window, ws: &WinState) -> bool {
     window
@@ -416,11 +429,7 @@ fn on_screen(window: &Window, ws: &WinState) -> bool {
         .map(|ms| {
             ms.iter().any(|m| {
                 let (p, s) = (m.position(), m.size());
-                let cx = ws.x + (ws.width as i32) / 2;
-                cx >= p.x
-                    && cx < p.x + s.width as i32
-                    && ws.y >= p.y
-                    && ws.y < p.y + s.height as i32 - 50
+                rect_on_monitor(ws, p.x, p.y, s.width, s.height)
             })
         })
         .unwrap_or(false)
@@ -428,10 +437,12 @@ fn on_screen(window: &Window, ws: &WinState) -> bool {
 
 fn restore_window(window: &Window, ws: &WinState) {
     if ws.width > 0 && ws.height > 0 {
-        let _ = window.set_size(PhysicalSize::new(ws.width, ws.height));
+        let w = ws.width.clamp(640, 16384);
+        let h = ws.height.clamp(400, 16384);
         if on_screen(window, ws) {
             let _ = window.set_position(PhysicalPosition::new(ws.x, ws.y));
         }
+        let _ = window.set_size(PhysicalSize::new(w, h));
     }
     if ws.maximized {
         let _ = window.maximize();
@@ -505,6 +516,7 @@ async fn new_tab(
     app: AppHandle,
     id: String,
     url: String,
+    activate: Option<bool>,
 ) -> Result<(), String> {
     require_ui(&webview)?;
     let window = app.get_window("main").ok_or("main window missing")?;
@@ -606,14 +618,19 @@ async fn new_tab(
         None
     };
 
-    window
+    let wv = window
         .add_child(
             configure(builder, ext_path.as_ref()),
             LogicalPosition::new(0.0, CHROME_H),
             LogicalSize::new(size.width, (size.height - CHROME_H).max(0.0)),
         )
         .map_err(|e| e.to_string())?;
-    show_only(&app, &id, true);
+    live::attach_tab_hooks(&wv, app.clone(), id.clone());
+    if activate.unwrap_or(true) {
+        show_only(&app, &id, true);
+    } else {
+        let _ = wv.hide();
+    }
     Ok(())
 }
 
@@ -1116,6 +1133,9 @@ fn main() {
                     layout(&w);
                     track_window(&w);
                 }
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    layout(&w);
+                }
                 WindowEvent::CloseRequested { .. } => {
                     track_window(&w);
                     persist_sync(w.app_handle());
@@ -1217,6 +1237,28 @@ mod tests {
         assert!(!allow_open_page_url("about:blank"));
         assert!(!allow_open_page_url("http://tauri.localhost/index.html"));
         assert!(!allow_open_page_url("file:///C:/Windows/win.ini"));
+    }
+
+    #[test]
+    fn test_on_screen_no_overflow() {
+        let extreme = WinState {
+            x: i32::MAX - 10,
+            y: i32::MAX - 10,
+            width: u32::MAX,
+            height: u32::MAX,
+            maximized: false,
+        };
+        assert!(!rect_on_monitor(&extreme, 0, 0, 1920, 1080));
+
+        let valid = WinState {
+            x: 100,
+            y: 100,
+            width: 1200,
+            height: 800,
+            maximized: false,
+        };
+        assert!(rect_on_monitor(&valid, 0, 0, 1920, 1080));
+        assert!(!rect_on_monitor(&valid, 1920, 0, 1920, 1080));
     }
 }
 

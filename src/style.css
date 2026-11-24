@@ -146,7 +146,17 @@ html.mica { background: transparent; color-scheme: normal !important; }
   gap: 2px;
   background: var(--bg3);
 }
-#tabs { display: flex; gap: 2px; min-width: 0; flex: 0 1 auto; }
+#tabs {
+  display: flex;
+  gap: 2px;
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  padding: 0 4px;
+}
+#tabs::-webkit-scrollbar { display: none; }
 .tab {
   position: relative;
   display: flex;
@@ -275,6 +285,8 @@ html.mica { background: transparent; color-scheme: normal !important; }
   width: 30%;
   border-radius: 1px;
   background: var(--brand);
+}
+#progress.on::after {
   animation: slide 1.4s ease-in-out infinite;
   will-change: transform;
 }
